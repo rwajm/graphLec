@@ -11,6 +11,7 @@ Features:
 """
 
 import json
+import os
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
@@ -20,8 +21,7 @@ from google.genai import types
 # ============================================================================ #
 #  설정                                                                         #
 # ============================================================================ #
-
-GOOGLE_API_KEY = "AIzaSyB1f8WjoQgPxbj0IhbBYNqVmR4F1msPR_Y"  # API 키 입력
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 EMBEDDING_MODEL = "models/gemini-embedding-001"
 CHAT_MODEL = "gemini-2.5-flash"
