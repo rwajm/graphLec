@@ -11,6 +11,7 @@ Features:
 """
 
 import json
+import os
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
@@ -20,8 +21,7 @@ from google.genai import types
 # ============================================================================ #
 #  설정                                                                         #
 # ============================================================================ #
-
-GOOGLE_API_KEY = "AIzaSyB1f8WjoQgPxbj0IhbBYNqVmR4F1msPR_Y"  # API 키 입력
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 EMBEDDING_MODEL = "models/gemini-embedding-001"
 CHAT_MODEL = "gemini-2.5-flash"
@@ -162,7 +162,9 @@ class KnowledgeGraphQA:
                 if slide.get('slide_id') == slide_id:
                     t3 = slide.get('t3', '')
                     if t3:
-                        slide_contents.append(f"[{slide_id}]\n{t3[:500]}")
+                        slide_contents.append(
+                            f"<source id=\"{slide_id}\">\n{t3[:500]}\n</source>"
+                        )
                     break
         
         context = f"【{concept_id}】\n"
@@ -170,36 +172,46 @@ class KnowledgeGraphQA:
             context += "관계:\n" + "\n".join(relations[:5]) + "\n"
         if slide_contents:
             context += "내용:\n" + "\n".join(slide_contents)
-        
+        context += "\n</concept>"
+
         return context
     
     def _ask_with_full_context(self, question: str) -> str:
-        """Fallback: t3 전체 전달"""
+        """Fallback: t3 전체 전달 (Long-Context 방식)"""
         print("⚠️ 유사도 낮음 → 전체 컨텍스트 사용")
         
         all_t3 = []
         for slide in self.slides:
             t3 = slide.get('t3', '')
             if t3:
-                all_t3.append(f"[{slide.get('slide_id')}]\n{t3}")
+                # 슬라이드 ID와 내용을 명확히 구분하여 추가
+                all_t3.append(f"[슬라이드: {slide.get('slide_id', 'Unknown')}]\n{t3}")
         
         full_context = "\n\n---\n\n".join(all_t3)
-        if len(full_context) > 30000:
-            full_context = full_context[:30000]
         
-        prompt = f"""아래 강의 내용을 바탕으로 질문에 답변하세요.
-
-    [강의 내용]
-    {full_context}
-
-    [질문]
-    {question}
-
-    지침:
-    - 위 내용에 있는 정보만 사용하세요.
-    - 관련 슬라이드 번호를 함께 언급하세요.
-    """
+        # 컨텍스트 길이 제한 설정
+        if len(full_context) > 100000:
+            full_context = full_context[:100000]
         
+        prompt = f"""당신은 강의 자료만을 근거로 답변하는 학습 도우미입니다.
+        아래 <lecture_content> 태그 안의 정보만 사용하여 질문에 답변하세요.
+
+        <lecture_content>
+        {full_context}
+        </lecture_content>
+
+        [질문]
+        {question}
+
+        [답변 규칙 - 반드시 준수]
+        1. 위 lecture_content에 있는 정보만 사용하세요. 외부 지식을 추가하지 마세요.
+        2. 모든 주장에는 출처를 반드시 표기하세요.
+        - 슬라이드 출처: [슬라이드: slide_id]
+        3. lecture_content에서 찾을 수 없는 내용은 "해당 정보는 강의 자료에 없습니다."라고 답하세요.
+        4. 답변 마지막에 [참고 자료] 섹션을 추가하고 사용한 슬라이드를 나열하세요.
+        """
+
+        # 실제 모델 호출 및 응답 반환 로직 추가
         response = self.client.models.generate_content(
             model=CHAT_MODEL,
             contents=prompt
@@ -237,18 +249,23 @@ class KnowledgeGraphQA:
         full_context = "\n\n---\n\n".join(contexts)
         
         # 4. 답변 생성
-        prompt = f"""아래 지식그래프 정보를 바탕으로 질문에 답변하세요.
+        prompt = f"""당신은 강의 자료만을 근거로 답변하는 학습 도우미입니다.
+    아래 <knowledge_graph> 태그 안의 정보만 사용하여 질문에 답변하세요.
 
-    [지식그래프 정보]
+    <knowledge_graph>
     {full_context}
+    </knowledge_graph>
 
     [질문]
     {question}
 
-    지침:
-    - 위 정보에 있는 내용만 사용하세요.
-    - 개념 간 관계를 활용하여 설명하세요.
-    - 정보가 부족하면 솔직히 말하세요.
+    [답변 규칙 - 반드시 준수]
+    1. 위 knowledge_graph에 명시된 정보만 사용하세요. 외부 지식을 추가하지 마세요.
+    2. 모든 주장에는 출처를 반드시 표기하세요.
+    - 슬라이드 출처: [슬라이드: slide_id]
+    - 개념 관계 출처: [개념: concept_id]
+    3. knowledge_graph에서 찾을 수 없는 내용은 "해당 정보는 강의 자료에 없습니다."라고 답하세요.
+    4. 답변 마지막에 [참고 자료] 섹션을 추가하고 사용한 모든 출처를 나열하세요.
     """
         
         response = self.client.models.generate_content(

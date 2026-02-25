@@ -38,6 +38,7 @@ class Config:
     output_dir: Path = Path("./output")
     embedding_model: str = "models/gemini-embedding-001"
     embedding_dim: int = 768
+    alpha: float = 0.4
     
     def __post_init__(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -85,65 +86,117 @@ class DataLoader:
 
 
 # ============================================================================ #
-#  타임스탬프 매칭                                                               #
+#  타임스탬프 + 임베딩 유사도 매칭                                                               #
 # ============================================================================ #
 
-class TimestampMatcher:
-    """슬라이드와 전사문 타임스탬프 기반 매칭"""
+class HybridMatcher:
+    """타임스탬프 + 임베딩 유사도 하이브리드 매칭"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.client = genai.Client(api_key=config.google_api_key)
+    
+    def _embed(self, text: str) -> List[float]:
+        if not text.strip():
+            return None
+        resp = self.client.models.embed_content(
+            model=self.config.embedding_model,
+            contents=text[:5000],
+            config=types.EmbedContentConfig(
+                output_dimensionality=self.config.embedding_dim
+            )
+        )
+        return resp.embeddings[0].values
+    
+    def _cosine_sim(self, a, b) -> float:
+        import numpy as np
+        if a is None or b is None:
+            return 0.0
+        a, b = np.array(a), np.array(b)
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
+    
+    def _timestamp_score(self, seg_start: float, seg_end: float,
+                          slide_start: float, slide_end: float) -> float:
+        """오디오 세그먼트가 슬라이드 시간 구간에 얼마나 겹치는지 (0~1)"""
+        overlap = max(0, min(seg_end, slide_end) - max(seg_start, slide_start))
+        seg_duration = seg_end - seg_start
+        if seg_duration == 0:
+            return 0.0
+        return overlap / seg_duration
     
     def match(self, slides: List[Dict], transcripts: List[Dict]) -> List[Dict]:
         if not slides:
             return []
         
-        # 각 슬라이드의 시간 구간 계산
+        # 슬라이드 시간 구간 계산
         for i, slide in enumerate(slides):
             if i < len(slides) - 1:
                 slide["timestamp_end"] = slides[i + 1]["timestamp"]
             else:
-                if transcripts:
-                    slide["timestamp_end"] = max(t["end"] for t in transcripts)
-                else:
-                    slide["timestamp_end"] = slide["timestamp"] + 60
+                slide["timestamp_end"] = max(t["end"] for t in transcripts) if transcripts else slide["timestamp"] + 60
         
-        # 각 슬라이드에 해당하는 전사문 매칭
+        # 슬라이드 t1 임베딩
+        logger.info("Embedding slide t1 texts...")
         for slide in slides:
-            start, end = slide["timestamp"], slide["timestamp_end"]
-            matched_texts = [
-                seg["text"] for seg in transcripts
-                if seg["end"] > start and seg["start"] < end
-            ]
-            slide["t2"] = " ".join(matched_texts)
+            slide["_t1_vec"] = self._embed(slide.get("t1", ""))
         
-        logger.info(f"✓ Matched t2 to {len(slides)} slides")
+        # 각 오디오 세그먼트를 최적 슬라이드에 배정
+        slide_t2_map = {s["slide_id"]: [] for s in slides}
+        
+        for seg in transcripts:
+            best_slide_id = None
+            best_score = -1
+            
+            seg_vec = self._embed(seg["text"])
+            
+            for slide in slides:
+                # 타임스탬프 점수
+                ts_score = self._timestamp_score(
+                    seg["start"], seg["end"],
+                    slide["timestamp"], slide["timestamp_end"]
+                )
+                
+                # 임베딩 유사도 점수
+                emb_score = self._cosine_sim(seg_vec, slide["_t1_vec"])
+                # cosine sim은 -1~1이므로 0~1로 정규화
+                emb_score = (emb_score + 1) / 2
+                
+                # 하이브리드 점수
+                score = self.config.alpha * ts_score + (1 - self.config.alpha) * emb_score
+                
+                if score > best_score:
+                    best_score = score
+                    best_slide_id = slide["slide_id"]
+            
+            if best_slide_id:
+                slide_t2_map[best_slide_id].append(seg["text"])
+        
+        # t2 배정
+        for slide in slides:
+            slide["t2"] = " ".join(slide_t2_map[slide["slide_id"]])
+            del slide["_t1_vec"]  # 임시 벡터 제거
+        
+        logger.info(f"✓ Hybrid matched t2 to {len(slides)} slides")
         return slides
 
-
-# ============================================================================ #
-#  텍스트 통합기 (t1 + t2 → t3)                                                  #
-# ============================================================================ #
 
 class TextIntegrator:
     """t1과 t2를 통합하여 t3 생성"""
     
     def integrate(self, slides: List[Dict]) -> List[Dict]:
-        """
-        t3 생성 규칙:
-        - t1 (슬라이드 텍스트)과 t2 (전사문)를 구분하여 합침
-        - 검색 및 임베딩에 사용할 통합 텍스트
-        """
         for slide in slides:
             t1 = slide.get("t1", "").strip()
             t2 = slide.get("t2", "").strip()
             title = slide.get("title", "")
             
             parts = []
-            
             if title:
                 parts.append(f"[제목] {title}")
-            
             if t1:
                 parts.append(f"[슬라이드 내용]\n{t1}")
-            
             if t2:
                 parts.append(f"[교수 설명]\n{t2}")
             
@@ -151,8 +204,8 @@ class TextIntegrator:
         
         logger.info(f"✓ Generated t3 for {len(slides)} slides")
         return slides
-
-
+    
+    
 # ============================================================================ #
 #  텍스트 벡터 생성기                                                            #
 # ============================================================================ #
@@ -229,7 +282,7 @@ class IntegrationPipeline:
         print("Stage 2: 타임스탬프 매칭")
         print("-"*70)
         
-        slides = TimestampMatcher().match(slides, transcripts)
+        slides = HybridMatcher(self.config).match(slides, transcripts)
         
         # Stage 3: 텍스트 통합 (t1 + t2 → t3)
         print("\n" + "-"*70)

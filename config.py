@@ -54,6 +54,8 @@ except ImportError:
 class PipelineConfig:
     """전체 파이프라인 통합 설정"""
 
+    alpha: float = 0.4  # 타임스탬프 가중치 (1-alpha = 임베딩 가중치)
+
     # ─── API 키 ──────────────────────────────────────────────────────────────
     google_api_key: str = field(
         default_factory=lambda: os.getenv("GOOGLE_API_KEY", "")
