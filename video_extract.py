@@ -5,11 +5,10 @@ Input:
   - slides/ 폴더: 슬라이드 이미지
 
 Output:
-  - slide_extracted.json: t1, image_vector 추출 결과
+  - slide_extracted.json: t1 추출 결과
 
 추출 항목:
   - t1: 슬라이드 원본 텍스트 (Gemini Vision)
-  - image_vector: 이미지 벡터 (ColPali)
 
 ※ 오디오 정제는 다음 단계에서 t1을 사용하여 진행
 """
@@ -59,13 +58,14 @@ class Config:
 
 # t1 추출용 프롬프트 (텍스트만)
 T1_EXTRACTION_PROMPT = """
-이 슬라이드 이미지에서 보이는 모든 텍스트를 추출하라.
+이 슬라이드 이미지에서 보이는 모든 텍스트와 구조 정보를 추출하라.
 설명 없이 JSON만 출력.
 
 출력 형식:
 {
   "title": "슬라이드 제목",
-  "raw_text": "슬라이드에 보이는 모든 텍스트 (위→아래, 좌→우 순서, 줄바꿈은 \\n)"
+  "raw_text": "슬라이드에 보이는 모든 텍스트 (위→아래, 좌→우 순서, 줄바꿈은 \\n)",
+  "structure": "다이어그램/표/화살표 관계를 텍스트로 기술"
 }
 
 추출 규칙:
@@ -73,6 +73,9 @@ T1_EXTRACTION_PROMPT = """
 - 원문 그대로 추출 (요약하지 말 것)
 - 불릿 포인트는 "- " 또는 "• "로 시작
 - 줄바꿈은 \\n으로 표시
+- structure 필드: 다이어그램이 없으면 빈 문자열
+  예시) "사용자 → 응용소프트웨어 → 운영체제 → 컴퓨터 하드웨어 (위에서 아래 계층 구조)"
+  예시) "운영체제 vs 응용소프트웨어 비교표: 목적(자원관리 vs 사용자목적), 개발언어(C/C++ vs 다양)"
 """
 
 
@@ -133,9 +136,11 @@ class T1Extractor:
             
         except Exception as e:
             logger.error(f"  ✗ t1 extraction failed for slide {slide['slide_number']}: {e}")
-            slide["title"] = f"Slide {slide['slide_number']}"
-            slide["t1"] = ""
-        
+            slide["title"] = result.get("title", f"Slide {slide['slide_number']}")
+            structure = result.get("structure", "")
+            raw_text = result.get("raw_text", "")
+            slide["t1"] = f"{raw_text}\n{structure}".strip() if structure else raw_text
+                    
         return slide
     
     def extract_batch(self, slides: List[Dict]) -> List[Dict]:
@@ -150,71 +155,11 @@ class T1Extractor:
 
 
 # ============================================================================ #
-#  이미지 벡터 추출기 (ColPali)                                                   #
-# ============================================================================ #
-
-class ImageVectorizer:
-    """슬라이드 이미지 → image_vector 추출"""
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.model = None
-        self.processor = None
-        
-        if COLPALI_AVAILABLE:
-            self._init_colpali()
-    
-    def _init_colpali(self):
-        logger.info(f"Loading ColPali: {self.config.colpali_model}")
-        self.device = self.config.device if torch.cuda.is_available() else "cpu"
-        
-        self.model = ColPali.from_pretrained(
-            self.config.colpali_model,
-            torch_dtype=torch.float32 if self.device == "cpu" else torch.float16
-        ).to(self.device).eval()
-        
-        self.processor = ColPaliProcessor.from_pretrained(self.config.colpali_model)
-        logger.info(f"✓ ColPali loaded on {self.device}")
-    
-    def vectorize(self, slides: List[Dict]) -> List[Dict]:
-        if not self.model:
-            logger.warning("ColPali not available, skipping image vectorization")
-            for slide in slides:
-                slide["image_vector"] = None
-                slide["patch_vectors"] = None
-            return slides
-        
-        logger.info(f"Extracting image vectors from {len(slides)} slides...")
-        
-        for i, slide in enumerate(slides):
-            image = slide.get("image")
-            if image is None:
-                image = Image.open(slide["image_path"]).convert("RGB")
-            
-            batch = self.processor.process_images([image]).to(self.device)
-            
-            with torch.no_grad():
-                embeddings = self.model(**batch)
-            
-            patch_vectors = embeddings.squeeze(0).cpu().numpy()
-            full_vector = patch_vectors.mean(axis=0)
-            
-            slide["image_vector"] = full_vector.tolist()
-            slide["patch_vectors"] = patch_vectors.tolist()
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"  [{i+1}/{len(slides)}] vectorized")
-        
-        logger.info(f"✓ Image vectorization complete")
-        return slides
-
-
-# ============================================================================ #
 #  파이프라인                                                                    #
 # ============================================================================ #
 
 class ExtractionPipeline:
-    """t1, image_vector 추출 파이프라인"""
+    """t1 추출 파이프라인"""
     
     def __init__(self, config: Config = None):
         self.config = config or Config()
@@ -241,17 +186,10 @@ class ExtractionPipeline:
         print("-"*70)
         
         slides = T1Extractor(self.config).extract_batch(slides)
-        
-        # Stage 3: 이미지 벡터 추출 (ColPali)
+                
+        # Stage 3: 결과 저장
         print("\n" + "-"*70)
-        print("Stage 3: 이미지 벡터 추출 (ColPali)")
-        print("-"*70)
-        
-        slides = ImageVectorizer(self.config).vectorize(slides)
-        
-        # Stage 4: 결과 저장
-        print("\n" + "-"*70)
-        print("Stage 4: 결과 저장")
+        print("Stage 3: 결과 저장")
         print("-"*70)
         
         # 타임스탬프 포맷팅
@@ -278,8 +216,6 @@ class ExtractionPipeline:
                     "image_path": s["image_path"],
                     "title": s["title"],
                     "t1": s["t1"],                      # 슬라이드 원본 텍스트
-                    "image_vector": s["image_vector"],  # ColPali 벡터
-                    "patch_vectors": s["patch_vectors"]
                 }
                 for s in slides
             ]
@@ -292,17 +228,17 @@ class ExtractionPipeline:
         logger.info(f"✓ Saved: {output_path}")
         
         # 경량 버전 (벡터 제외)
-        result_light = {
-            "metadata": result["metadata"],
-            "slides": [
-                {k: v for k, v in s.items() if k not in ["image_vector", "patch_vectors"]}
-                for s in result["slides"]
-            ]
-        }
-        light_path = self.config.output_dir / "slide_extracted_light.json"
-        with open(light_path, 'w', encoding='utf-8') as f:
-            json.dump(result_light, f, indent=2, ensure_ascii=False)
-        logger.info(f"✓ Saved (light): {light_path}")
+        # result_light = {
+        #     "metadata": result["metadata"],
+        #     "slides": [
+        #         {k: v for k, v in s.items() if k not in ["image_vector", "patch_vectors"]}
+        #         for s in result["slides"]
+        #     ]
+        # }
+        # light_path = self.config.output_dir / "slide_extracted_light.json"
+        # with open(light_path, 'w', encoding='utf-8') as f:
+        #     json.dump(result_light, f, indent=2, ensure_ascii=False)
+        # logger.info(f"✓ Saved (light): {light_path}")
         
         # 완료 리포트
         total_time = time.time() - start_time
@@ -312,7 +248,6 @@ class ExtractionPipeline:
         print(f"\n📊 결과:")
         print(f"  • 슬라이드: {len(slides)}개")
         print(f"  • t1 추출: {sum(1 for s in slides if s['t1'])}개")
-        print(f"  • 이미지 벡터: {sum(1 for s in slides if s.get('image_vector'))}개")
         print(f"\n📁 생성된 파일:")
         print(f"  • {output_path}")
         print(f"  • {light_path}")
@@ -328,7 +263,7 @@ class ExtractionPipeline:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description="t1, image_vector 추출")
+    parser = argparse.ArgumentParser(description="t1 추출")
     parser.add_argument("-s", "--slides", default="./slides")
     parser.add_argument("-o", "--output", default="./output")
     

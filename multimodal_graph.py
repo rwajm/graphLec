@@ -19,10 +19,18 @@ import os
 import json
 import logging
 import time
+import re
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 from dataclasses import dataclass
 import google.generativeai as genai
+from PIL import Image
+
+try:
+    from json_repair import repair_json
+    JSON_REPAIR_AVAILABLE = True
+except ImportError:
+    JSON_REPAIR_AVAILABLE = False
 
 try:
     from pyvis.network import Network
@@ -49,6 +57,9 @@ class Config:
     slide_extracted_json: Path = Path("./output/slide_extracted.json")
     output_dir: Path = Path("./output")
     gemini_model: str = "models/gemini-2.5-flash"
+    # [FIX 3] 재시도 설정
+    max_retries: int = 3
+    retry_delay: float = 5.0
 
     def __post_init__(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -62,7 +73,9 @@ RELATION_TYPES = {
     "solves", "optimizes"
 }
 
-#개념/관계 추출 프롬프트(개념 유형 명시 + 슬라이드 컨텍스트 포함)
+# 개념/관계 추출 프롬프트
+# [FIX 1] evidence 필드에서 JSON을 깨는 특수문자/개행을 방지하기 위해
+#         evidence를 단순 짧은 키워드 문자열로 제한하도록 지시 추가
 
 EXTRACTION_PROMPT = """
 아래 강의 슬라이드에서 핵심 개념과 관계를 추출하여 JSON으로 반환하라.
@@ -83,7 +96,7 @@ EXTRACTION_PROMPT = """
       "from": "출발 개념",
       "to": "도착 개념",
       "type": "관계 타입",
-      "evidence": "근거 문장"
+      "evidence": "근거 키워드 (20자 이내, 특수문자/개행 금지)"
     }}
   ]
 }}
@@ -117,6 +130,11 @@ EXTRACTION_PROMPT = """
 - 섹션 제목이나 목차 표현(예: '운영체제의 태동', '운영체제 종류')은 제외
 - 강사가 예시로 언급한 구체적 소프트웨어(크롬, 탐색기 등)와 
   프로그래밍 키워드(malloc 등)도 개념으로 포함
+
+주의:
+- evidence 값은 20자 이내의 짧은 한국어 키워드만 사용
+- evidence에 콜론(:), 개행(\\n), 탭(\\t), 따옴표 등 특수문자 사용 금지
+- 코드 스니펫이나 긴 문장을 evidence에 넣지 말 것
 """
 
 
@@ -162,6 +180,104 @@ class ConceptRelationExtractor:
         self.model = genai.GenerativeModel(config.gemini_model)
         logger.info(f"✓ Gemini initialized for extraction")
 
+    # ------------------------------------------------------------------
+    # [FIX 1] JSON 정제 헬퍼
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _sanitize_response(text: str) -> str:
+        """Gemini 응답에서 JSON 블록만 추출하고 기본 정제 수행"""
+        # 마크다운 코드 블록 제거
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+
+        text = text.strip()
+
+        # evidence 값 내부의 개행·탭·제어문자를 공백으로 치환
+        # JSON string value 내부만 타겟: "evidence": "...<개행>..."
+        def clean_string_value(m):
+            inner = m.group(1)
+            # 개행, 탭, 제어문자 → 공백
+            inner = re.sub(r'[\n\r\t]', ' ', inner)
+            # 연속 공백 정리
+            inner = re.sub(r' {2,}', ' ', inner).strip()
+            return f'"{inner}"'
+
+        text = re.sub(r'"((?:[^"\\]|\\.)*)"', clean_string_value, text)
+        return text
+
+    @staticmethod
+    def _parse_json_robust(text: str) -> dict:
+        """
+        JSON 파싱 3단계 시도:
+          1. 표준 json.loads
+          2. json_repair (available 시)
+          3. concepts/relations 각각 수동 추출 후 fallback
+        """
+        # 1차: 표준 파싱
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # 2차: json_repair
+        if JSON_REPAIR_AVAILABLE:
+            try:
+                repaired = repair_json(text)
+                result = json.loads(repaired)
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
+
+        # 3차: 정규식으로 concepts 배열만이라도 구출
+        concepts = []
+        relations = []
+
+        concepts_match = re.search(r'"concepts"\s*:\s*(\[.*?\])', text, re.DOTALL)
+        if concepts_match:
+            try:
+                concepts = json.loads(concepts_match.group(1))
+            except Exception:
+                pass
+
+        # relations는 파싱 실패 시 빈 리스트로 처리 (개념이라도 확보)
+        relations_match = re.search(r'"relations"\s*:\s*(\[.*?\])', text, re.DOTALL)
+        if relations_match:
+            try:
+                relations = json.loads(relations_match.group(1))
+            except Exception:
+                pass
+
+        if concepts:
+            logger.warning("  ⚠ JSON repair fallback: extracted concepts only")
+            return {"concepts": concepts, "relations": relations}
+
+        raise ValueError("JSON parsing failed after all fallback attempts")
+
+    # ------------------------------------------------------------------
+    # [FIX 3] 재시도 로직을 포함한 Gemini 호출
+    # ------------------------------------------------------------------
+    def _call_gemini(self, prompt: str, image=None) -> str:
+        last_exc = None
+        for attempt in range(self.config.max_retries):
+            try:
+                if image is not None:
+                    response = self.model.generate_content([prompt, image])
+                else:
+                    response = self.model.generate_content(prompt)
+                return response.text
+            except Exception as e:
+                last_exc = e
+                # 500 서버 오류 또는 네트워크 오류 → 재시도
+                logger.warning(
+                    f"  ⚠ Gemini call failed (attempt {attempt+1}/{self.config.max_retries}): {e}"
+                )
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(self.config.retry_delay * (attempt + 1))
+        raise last_exc
+
     def extract(self, slide: Dict) -> Dict:
         """단일 슬라이드에서 개념/관계 추출"""
         t3 = slide.get("t3", "")
@@ -171,7 +287,6 @@ class ConceptRelationExtractor:
             slide["relations"] = []
             return slide
 
-        # 슬라이드 번호·제목 프롬프트에 포함
         slide_num = slide.get("slide_number", "?")
         title = slide.get("title", "제목 없음")
 
@@ -181,16 +296,17 @@ class ConceptRelationExtractor:
                 title=title,
                 content=t3
             )
-            response = self.model.generate_content(prompt)
-            text = response.text
+            image_path = slide.get("image_path")
+            image = None
+            if image_path and Path(image_path).exists():
+                image = Image.open(image_path).convert("RGB")
 
-            # JSON 파싱
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0]
+            # [FIX 3] 재시도 포함 호출
+            raw_text = self._call_gemini(prompt, image)
 
-            result = json.loads(text.strip())
+            # [FIX 1] 정제 후 robust 파싱
+            cleaned = self._sanitize_response(raw_text)
+            result = self._parse_json_robust(cleaned)
 
             # 관계 타입 검증 및 자기참조 제거
             relations = [
@@ -271,6 +387,27 @@ class KnowledgeGraphBuilder:
     def __init__(self):
         self.normalizer = ConceptNormalizer()
 
+    def _ensure_concept(
+        self,
+        concept_data: dict,
+        concept: str,
+        slide_id: str,
+        text_vector,
+        image_vector
+    ):
+        """concept_data에 개념 노드가 없으면 초기화하고 슬라이드/벡터 추가"""
+        if concept not in concept_data:
+            concept_data[concept] = {
+                "slides": [],
+                "text_vectors": [],
+                "image_vectors": []
+            }
+        concept_data[concept]["slides"].append(slide_id)
+        if text_vector:
+            concept_data[concept]["text_vectors"].append(text_vector)
+        if image_vector:
+            concept_data[concept]["image_vectors"].append(image_vector)
+
     def build(
         self,
         slides: List[Dict],
@@ -312,24 +449,14 @@ class KnowledgeGraphBuilder:
             text_vector = slide.get("text_vector")
             image_vector = image_vectors.get(slide_id)
 
-            # 개념 수집
+            # 개념 수집 (concepts 리스트 기반)
             for concept in slide.get("concepts", []):
                 normalized = self.normalizer.normalize(concept)
                 if not normalized:
                     continue
-
-                if normalized not in concept_data:
-                    concept_data[normalized] = {
-                        "slides": [],
-                        "text_vectors": [],
-                        "image_vectors": []
-                    }
-
-                concept_data[normalized]["slides"].append(slide_id)
-                if text_vector:
-                    concept_data[normalized]["text_vectors"].append(text_vector)
-                if image_vector:
-                    concept_data[normalized]["image_vectors"].append(image_vector)
+                self._ensure_concept(
+                    concept_data, normalized, slide_id, text_vector, image_vector
+                )
 
             # 관계 수집
             for rel in slide.get("relations", []):
@@ -339,6 +466,14 @@ class KnowledgeGraphBuilder:
 
                 if not from_concept or not to_concept or from_concept == to_concept:
                     continue
+
+                # [FIX 2] 엣지의 from/to 개념이 concepts에 없더라도 노드로 등록
+                self._ensure_concept(
+                    concept_data, from_concept, slide_id, text_vector, image_vector
+                )
+                self._ensure_concept(
+                    concept_data, to_concept, slide_id, text_vector, image_vector
+                )
 
                 edge_key = (from_concept, to_concept, rel_type)
                 if edge_key not in edge_set:
@@ -437,13 +572,21 @@ class GraphVisualizer:
             spring_length=200
         )
 
+        # min-max 정규화를 위한 frequency 범위 계산
+        frequencies = [n.get("frequency", 1) for n in graph["nodes"] if n["type"] == "concept"]
+        freq_min = min(frequencies) if frequencies else 1
+        freq_max = max(frequencies) if frequencies else 1
+        freq_range = freq_max - freq_min if freq_max != freq_min else 1
+
         # 노드 추가
         for node in graph["nodes"]:
             node_id = node["id"]
             node_type = node["type"]
 
             if node_type == "concept":
-                size = 15 + node.get("frequency", 1) * 5
+                freq = node.get("frequency", 1)
+                normalized = (freq - freq_min) / freq_range  # 0~1
+                size = 10 + normalized * 30  # 최소 10, 최대 40
                 net.add_node(
                     node_id,
                     label=node_id,
@@ -493,7 +636,7 @@ class GraphVisualizer:
 
 
 # ============================================================================ #
-#  파이프라인                                                                    #
+#  파이프라인                                                                   #
 # ============================================================================ #
 
 class GraphPipeline:
