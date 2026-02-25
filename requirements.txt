@@ -1,0 +1,23 @@
+# GPU 사용 시 torch는 아래 링크에서 CUDA 버전에 맞게 먼저 설치:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# ── Core ──────────────────────────────────────────────────────
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# ── Gemini API ────────────────────────────────────────────────
+google-generativeai>=0.8.0
+google-genai>=0.8.0
+
+# ── ColPali (이미지 벡터화) ────────────────────────────────────
+torch>=2.0.0
+colpali-engine>=0.3.0
+transformers>=4.40.0
+
+# ── Graph 시각화 ──────────────────────────────────────────────
+pyvis>=0.3.2
+
+# ── Optional ─────────────────────────────────────────────────
+python-dotenv>=1.0.0

@@ -1,6 +1,4 @@
-# graphLec
-
-# GraphBrief / EduCurator
+# GraphLec
 
 강의 영상을 입력으로 받아 슬라이드 이미지 추출 → 텍스트/벡터 추출 → 오디오 통합 → 지식그래프 생성까지 자동으로 처리하는 멀티모달 파이프라인입니다.
 
@@ -96,8 +94,8 @@ audio.json   ──┤
 ### 1. 저장소 클론
 
 ```bash
-git clone https://github.com/your-repo/graphbrief.git
-cd graphbrief
+git clone https://github.com/your-repo/graphlec.git
+cd graphlec
 ```
 
 ### 2. 가상환경 생성 (권장)
