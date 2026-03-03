@@ -102,18 +102,25 @@ EXTRACTION_PROMPT = """
 }}
 
 관계 타입 (12가지만 사용):
-- is_a: A는 B의 한 종류
-- part_of: A는 B의 구성요소
-- implements: A는 B를 구현
-- abstracts: A는 B들을 추상화
-- prerequisite_of: A를 알아야 B 이해 가능
-- uses: A는 B를 사용
-- calls: A가 B를 호출
-- compared_to: A와 B 비교
-- extends: A가 B를 확장
-- replaces: A가 B를 대체
-- solves: A가 B(문제)를 해결
-- optimizes: A가 B를 최적화
+방향 규칙: "from" → "to" 방향은 반드시 아래 정의를 따를 것.
+
+[계층 관계 — 방향 혼동 주의]
+- is_a:    from=하위 개념, to=상위 개념  (모드 레지스터 is_a CPU 구성요소 ❌ / 커널 코드 is_a 커널 ✓)
+           "A는 B의 한 종류"이므로 A(from)가 더 구체적, B(to)가 더 일반적
+- part_of: from=부분,      to=전체       (CPU part_of 모드 레지스터 ❌ / 모드 레지스터 part_of CPU ✓)
+           "A는 B에 포함"이므로 A(from)가 구성요소, B(to)가 전체
+
+[기능/의존 관계]
+- implements:    from=구현체,   to=인터페이스/명세  (시스템 호출 implements API ✓)
+- abstracts:     from=추상화,   to=구체 대상들      (프로세스 abstracts 프로그램 ✓)
+- prerequisite_of: from=선수지식, to=목표 개념      (가상 메모리 prerequisite_of 페이징 ✓)
+- uses:          from=사용 주체, to=사용 대상       (커널 uses 시스템 호출 ✓)
+- calls:         from=호출자,    to=피호출자         (응용프로그램 calls 시스템 호출 ✓)
+- compared_to:   from=비교 대상 A, to=비교 대상 B   (인터럽트 compared_to 폴링 ✓)
+- extends:       from=확장체,   to=기반             (Linux extends Unix ✓)
+- replaces:      from=새 것,    to=구 것            (syscall replaces int 0x80 ✓)
+- solves:        from=해결책,   to=문제             (가상 메모리 solves 물리 메모리 부족 ✓)
+- optimizes:     from=최적화 수단, to=최적화 대상   (캐시 optimizes 메모리 접근 ✓)
 
 개념 추출 규칙:
 - 슬라이드 제목과 번호를 반드시 참고하여 해당 슬라이드의 주제에 맞는 개념을 추출하라
@@ -124,12 +131,21 @@ EXTRACTION_PROMPT = """
   4. 문제/현상: 유휴 상태, 교착 상태, 메모리 보호, CPU 활용률 등
 - 슬라이드당 최소 5개, 최대 15개 추출
 - 개념은 명사 또는 명사구로 추출
-- 동일 개념은 하나로 통일 (예: "시스템 호출", "system call" → "시스템 호출")
+- 동일 개념은 슬라이드 전체에서 하나의 표기로 통일할 것
+  한글/영문 혼용 금지: fflush → fflush (영문 고유명사는 영문 유지)
+  오타 금지: '응용프로gram' → '응용프로그램'
+  문장형 개념명 금지: '높은 커널 모드 시간 비율' → '커널 모드 시간 비율'
+  (형용사/부사로 시작하는 개념명은 핵심 명사구로 축약)
 - 자기 자신과의 관계는 제외
 - 너무 일반적이거나 강의 주제와 무관한 단어(예: "방법", "과정", "특징")는 제외
 - 섹션 제목이나 목차 표현(예: '운영체제의 태동', '운영체제 종류')은 제외
 - 강사가 예시로 언급한 구체적 소프트웨어(크롬, 탐색기 등)와 
   프로그래밍 키워드(malloc 등)도 개념으로 포함
+- 추출한 개념은 반드시 다른 개념과의 관계(relations)가 1개 이상 있어야 함
+  관계를 정의할 수 없는 개념은 추출하지 말 것
+- 성능 지표처럼 여러 개념이 묶이는 경우, 공통 상위 개념을 명시적으로 추출하고
+  각각을 part_of로 연결할 것
+  예) 시스템 처리율, 시스템 호출 횟수 → 둘 다 "시스템 성능 지표" part_of 관계
 
 주의:
 - evidence 값은 20자 이내의 짧은 한국어 키워드만 사용
