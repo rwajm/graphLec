@@ -18,6 +18,13 @@ from typing import Dict, List, Set, Tuple
 from google import genai
 from google.genai import types
 
+# ─── .env 파일 지원 ─────────────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ============================================================================ #
 #  설정                                                                         #
 # ============================================================================ #
