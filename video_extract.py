@@ -9,6 +9,7 @@ Output:
 
 추출 항목:
   - t1: 슬라이드 원본 텍스트 (Gemini Vision)
+  - t1_structure: 다이어그램/표/화살표 관계 (Stage 3 관계 추출 힌트)
 
 ※ 오디오 정제는 다음 단계에서 t1을 사용하여 진행
 """
@@ -19,18 +20,19 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from PIL import Image
-import google.generativeai as genai
+
+# Stage 2와 동일한 SDK 사용
+from google import genai
+from google.genai import types
 
 try:
-    import torch
-    from colpali_engine.models import ColPali, ColPaliProcessor
-    COLPALI_AVAILABLE = True
+    from json_repair import repair_json
+    JSON_REPAIR_AVAILABLE = True
 except ImportError:
-    COLPALI_AVAILABLE = False
-    print("⚠️ ColPali not installed. Image vectorization will be skipped.")
+    JSON_REPAIR_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,14 +51,14 @@ class Config:
     slides_dir: Path = Path("./slides")
     output_dir: Path = Path("./output")
     gemini_model: str = "models/gemini-2.5-flash"
-    colpali_model: str = "vidore/colpali-v1.2"
-    device: str = "cuda"
-    
+    max_retries: int = 3
+    retry_delay: float = 5.0
+
     def __post_init__(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
 
-# t1 추출용 프롬프트 (텍스트만)
+# t1 추출용 프롬프트
 T1_EXTRACTION_PROMPT = """
 이 슬라이드 이미지에서 보이는 모든 텍스트와 구조 정보를 추출하라.
 설명 없이 JSON만 출력.
@@ -86,11 +88,11 @@ T1_EXTRACTION_PROMPT = """
 class SlideLoader:
     def __init__(self, slides_dir: Path):
         self.slides_dir = Path(slides_dir)
-    
+
     def load(self) -> List[Dict]:
         slides = []
         pattern = re.compile(r'slide_(\d+)_(\d+\.?\d*)s\.(jpg|png)')
-        
+
         for file in sorted(self.slides_dir.iterdir()):
             match = pattern.match(file.name)
             if match:
@@ -100,57 +102,107 @@ class SlideLoader:
                     "image_path": str(file),
                     "image": Image.open(file).convert("RGB")
                 })
-        
+
         logger.info(f"✓ Loaded {len(slides)} slides")
         return slides
 
 
 # ============================================================================ #
-#  t1 추출기 (Gemini Vision - 슬라이드 텍스트만)                                   #
+#  t1 추출기 (Gemini Vision)                                                    #
 # ============================================================================ #
 
 class T1Extractor:
-    """슬라이드 이미지 → t1 (원본 텍스트) 추출"""
-    
+    """슬라이드 이미지 → t1 (원본 텍스트) + t1_structure 추출"""
+
     def __init__(self, config: Config):
         self.config = config
-        genai.configure(api_key=config.google_api_key)
-        self.model = genai.GenerativeModel(config.gemini_model)
-        logger.info(f"✓ Gemini initialized for t1 extraction")
-    
+        # Stage 2와 동일한 방식으로 클라이언트 초기화
+        self.client = genai.Client(api_key=config.google_api_key)
+        logger.info("✓ Gemini initialized for t1 extraction")
+
+    def _call_gemini(self, image: Image.Image) -> str:
+        """재시도 로직 포함 Gemini Vision 호출"""
+        last_exc = None
+        for attempt in range(self.config.max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.config.gemini_model,
+                    contents=[T1_EXTRACTION_PROMPT, image],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                return response.text
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    f"  ⚠ Gemini call failed "
+                    f"(attempt {attempt+1}/{self.config.max_retries}): {e}"
+                )
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(self.config.retry_delay * (attempt + 1))
+        raise last_exc
+
     def extract(self, slide: Dict) -> Dict:
-        """단일 슬라이드에서 t1 추출"""
+        """단일 슬라이드에서 t1, t1_structure 추출"""
+        # 실패 시 폴백 기본값을 미리 설정
+        slide.setdefault("title", f"Slide {slide['slide_number']}")
+        slide.setdefault("t1", "")
+        slide.setdefault("t1_structure", "")
+
         try:
-            response = self.model.generate_content([T1_EXTRACTION_PROMPT, slide["image"]])
-            text = response.text
-            
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0]
-            
-            result = json.loads(text.strip())
-            
+            raw_text = self._call_gemini(slide["image"])
+
+            # 1. 코드펜스 제거
+            if "```json" in raw_text:
+                raw_text = raw_text.split("```json")[1].split("```")[0]
+            elif "```" in raw_text:
+                raw_text = raw_text.split("```")[1].split("```")[0]
+            raw_text = raw_text.strip()
+
+            # 2. 문자열 값 내부의 제어문자 정제
+            def clean_string_value(m):
+                inner = m.group(1)
+                inner = re.sub(r'[\n\r\t]', ' ', inner)
+                inner = re.sub(r' {2,}', ' ', inner).strip()
+                return f'"{inner}"'
+            raw_text = re.sub(r'"((?:[^"\\]|\\.)*)"', clean_string_value, raw_text)
+
+            # 3. 파싱 시도 → json_repair fallback
+            try:
+                result = json.loads(raw_text)
+            except json.JSONDecodeError:
+                if JSON_REPAIR_AVAILABLE:
+                    result = json.loads(repair_json(raw_text))
+                else:
+                    raise
+
             slide["title"] = result.get("title", f"Slide {slide['slide_number']}")
             slide["t1"] = result.get("raw_text", "")
-            
+            # structure를 t1에 합치지 않고 별도 필드로 분리
+            # → Stage 3 프롬프트에서 관계 추출 힌트로 독립적으로 활용 가능
+            slide["t1_structure"] = result.get("structure", "")
+
         except Exception as e:
-            logger.error(f"  ✗ t1 extraction failed for slide {slide['slide_number']}: {e}")
-            slide["title"] = result.get("title", f"Slide {slide['slide_number']}")
-            structure = result.get("structure", "")
-            raw_text = result.get("raw_text", "")
-            slide["t1"] = f"{raw_text}\n{structure}".strip() if structure else raw_text
-                    
+            # result가 정의되지 않은 상태일 수 있으므로 기본값(setdefault)으로만 처리
+            logger.error(
+                f"  ✗ t1 extraction failed for slide {slide['slide_number']}: {e}"
+            )
+
         return slide
-    
+
     def extract_batch(self, slides: List[Dict]) -> List[Dict]:
         logger.info(f"Extracting t1 from {len(slides)} slides...")
-        
+
         for i, slide in enumerate(slides):
             self.extract(slide)
-            logger.info(f"  [{i+1}/{len(slides)}] Slide {slide['slide_number']}: t1={len(slide['t1'])} chars")
-        
-        logger.info(f"✓ t1 extraction complete")
+            logger.info(
+                f"  [{i+1}/{len(slides)}] Slide {slide['slide_number']}: "
+                f"t1={len(slide['t1'])} chars, "
+                f"structure={len(slide['t1_structure'])} chars"
+            )
+
+        logger.info("✓ t1 extraction complete")
         return slides
 
 
@@ -160,47 +212,46 @@ class T1Extractor:
 
 class ExtractionPipeline:
     """t1 추출 파이프라인"""
-    
+
     def __init__(self, config: Config = None):
         self.config = config or Config()
-    
+
     def run(self) -> Dict:
         start_time = time.time()
-        
+
         print("\n" + "="*70)
         print("🎓 슬라이드 데이터 추출 파이프라인 (Stage 1)")
         print("="*70)
         print(f"📁 Slides: {self.config.slides_dir}")
         print(f"📂 Output: {self.config.output_dir}")
-        
+
         # Stage 1: 슬라이드 로드
         print("\n" + "-"*70)
         print("Stage 1: 슬라이드 로드")
         print("-"*70)
-        
+
         slides = SlideLoader(self.config.slides_dir).load()
-        
-        # Stage 2: t1 추출 (슬라이드 텍스트)
+
+        # Stage 2: t1 추출 (슬라이드 텍스트 + 구조)
         print("\n" + "-"*70)
         print("Stage 2: t1 추출 (Gemini Vision)")
         print("-"*70)
-        
+
         slides = T1Extractor(self.config).extract_batch(slides)
-                
+
         # Stage 3: 결과 저장
         print("\n" + "-"*70)
         print("Stage 3: 결과 저장")
         print("-"*70)
-        
-        # 타임스탬프 포맷팅
+
+        # 타임스탬프 포맷팅 및 slide_id 생성
         for slide in slides:
             ts = slide["timestamp"]
             mins, secs = divmod(ts, 60)
             hrs, mins = divmod(mins, 60)
             slide["timestamp_formatted"] = f"{int(hrs):02d}:{int(mins):02d}:{secs:05.2f}"
             slide["slide_id"] = f"slide_{slide['slide_number']:03d}"
-        
-        # 결과 구성
+
         result = {
             "metadata": {
                 "slides_dir": str(self.config.slides_dir),
@@ -215,44 +266,34 @@ class ExtractionPipeline:
                     "timestamp_formatted": s["timestamp_formatted"],
                     "image_path": s["image_path"],
                     "title": s["title"],
-                    "t1": s["t1"],                      # 슬라이드 원본 텍스트
+                    "t1": s["t1"],
+                    # raw_text와 분리 저장 — Stage 3에서 관계 추출 시 독립적으로 참조
+                    "t1_structure": s["t1_structure"],
                 }
                 for s in slides
             ]
         }
-        
-        # 전체 저장 (벡터 포함)
+
         output_path = self.config.output_dir / "slide_extracted.json"
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         logger.info(f"✓ Saved: {output_path}")
-        
-        # 경량 버전 (벡터 제외)
-        # result_light = {
-        #     "metadata": result["metadata"],
-        #     "slides": [
-        #         {k: v for k, v in s.items() if k not in ["image_vector", "patch_vectors"]}
-        #         for s in result["slides"]
-        #     ]
-        # }
-        # light_path = self.config.output_dir / "slide_extracted_light.json"
-        # with open(light_path, 'w', encoding='utf-8') as f:
-        #     json.dump(result_light, f, indent=2, ensure_ascii=False)
-        # logger.info(f"✓ Saved (light): {light_path}")
-        
+
         # 완료 리포트
         total_time = time.time() - start_time
+        structure_count = sum(1 for s in slides if s.get("t1_structure"))
+
         print("\n" + "="*70)
         print("✅ 추출 완료!")
         print("="*70)
         print(f"\n📊 결과:")
         print(f"  • 슬라이드: {len(slides)}개")
         print(f"  • t1 추출: {sum(1 for s in slides if s['t1'])}개")
+        print(f"  • t1_structure 추출: {structure_count}개")
         print(f"\n📁 생성된 파일:")
         print(f"  • {output_path}")
-        print(f"  • {light_path}")
         print(f"\n⏱️ 처리 시간: {total_time:.2f}초")
-        
+
         return result
 
 
@@ -262,22 +303,25 @@ class ExtractionPipeline:
 
 def main():
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="t1 추출")
     parser.add_argument("-s", "--slides", default="./slides")
     parser.add_argument("-o", "--output", default="./output")
-    
+    parser.add_argument("--retries", type=int, default=3,
+                        help="Gemini API 재시도 횟수 (default: 3)")
+
     args = parser.parse_args()
-    
+
     config = Config(
         slides_dir=Path(args.slides),
-        output_dir=Path(args.output)
+        output_dir=Path(args.output),
+        max_retries=args.retries,
     )
-    
+
     if not config.slides_dir.exists():
         print(f"❌ Slides folder not found: {config.slides_dir}")
         return
-    
+
     pipeline = ExtractionPipeline(config)
     pipeline.run()
 

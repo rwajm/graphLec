@@ -2,17 +2,19 @@
 지식그래프 생성 파이프라인 (Stage 3)
 
 Input:
-  - integrated_text.json: t3 + text_vector
-  - slide_extracted.json: image_vector
+  - integrated_text.json: t3 + text_vector (Stage 2 출력)
+  - slide_extracted.json: t1_structure (Stage 1 출력)
 
 Output:
   - knowledge_graph.json: 개념, 관계, 벡터 통합
+  - knowledge_graph_light.json: 벡터 제외 경량 버전
   - knowledge_graph.html: 시각화
 
 파이프라인:
-  1. t3 → 개념/관계 추출 (Gemini)
-  2. text_vector + image_vector 병합
-  3. 그래프 구축 및 시각화
+  1. t3 + t1_structure → 개념/관계 추출 (Gemini)
+  2. 관계 검증 (hallucination 필터)
+  3. 그래프 구축 (관계 weight 누적)
+  4. 시각화
 """
 
 import os
@@ -21,10 +23,14 @@ import logging
 import time
 import re
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
-from dataclasses import dataclass
-import google.generativeai as genai
+from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+import numpy as np
 from PIL import Image
+
+# Stage 1, 2와 동일한 SDK 사용
+from google import genai
+from google.genai import types
 
 try:
     from json_repair import repair_json
@@ -57,12 +63,15 @@ class Config:
     slide_extracted_json: Path = Path("./output/slide_extracted.json")
     output_dir: Path = Path("./output")
     gemini_model: str = "models/gemini-2.5-flash"
-    # [FIX 3] 재시도 설정
     max_retries: int = 3
     retry_delay: float = 5.0
+    # 동의어 사전 외부 파일 — 강의별로 교체 가능
+    synonyms_path: Optional[Path] = None
 
     def __post_init__(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.synonyms_path:
+            self.synonyms_path = Path(self.synonyms_path)
 
 
 # 12가지 관계 타입
@@ -73,10 +82,8 @@ RELATION_TYPES = {
     "solves", "optimizes"
 }
 
-# 개념/관계 추출 프롬프트
-# [FIX 1] evidence 필드에서 JSON을 깨는 특수문자/개행을 방지하기 위해
-#         evidence를 단순 짧은 키워드 문자열로 제한하도록 지시 추가
-
+# t1_structure 섹션을 포함한 추출 프롬프트
+# 슬라이드 구조 정보(다이어그램/표/화살표)를 관계 추출의 우선 근거로 활용
 EXTRACTION_PROMPT = """
 아래 강의 슬라이드에서 핵심 개념과 관계를 추출하여 JSON으로 반환하라.
 설명 없이 JSON만 출력.
@@ -87,6 +94,13 @@ EXTRACTION_PROMPT = """
 
 [강의 내용]
 {content}
+
+[슬라이드 구조]
+{structure}
+
+※ [슬라이드 구조]가 비어있지 않으면, 화살표/계층/비교표 등의 관계를 relations 추출의 우선 근거로 사용하라.
+  예) "A → B → C (계층 구조)" → A part_of B, B part_of C 관계 추출
+  예) "X vs Y 비교표" → X compared_to Y 관계 추출
 
 출력 형식:
 {{
@@ -139,7 +153,7 @@ EXTRACTION_PROMPT = """
 - 자기 자신과의 관계는 제외
 - 너무 일반적이거나 강의 주제와 무관한 단어(예: "방법", "과정", "특징")는 제외
 - 섹션 제목이나 목차 표현(예: '운영체제의 태동', '운영체제 종류')은 제외
-- 강사가 예시로 언급한 구체적 소프트웨어(크롬, 탐색기 등)와 
+- 강사가 예시로 언급한 구체적 소프트웨어(크롬, 탐색기 등)와
   프로그래밍 키워드(malloc 등)도 개념으로 포함
 - 추출한 개념은 반드시 다른 개념과의 관계(relations)가 1개 이상 있어야 함
   관계를 정의할 수 없는 개념은 추출하지 말 것
@@ -151,6 +165,7 @@ EXTRACTION_PROMPT = """
 - evidence 값은 20자 이내의 짧은 한국어 키워드만 사용
 - evidence에 콜론(:), 개행(\\n), 탭(\\t), 따옴표 등 특수문자 사용 금지
 - 코드 스니펫이나 긴 문장을 evidence에 넣지 말 것
+- relations의 from/to는 반드시 concepts 리스트 안에 있는 개념만 사용할 것
 """
 
 
@@ -159,6 +174,7 @@ EXTRACTION_PROMPT = """
 # ============================================================================ #
 
 class DataLoader:
+
     @staticmethod
     def load_integrated_text(path: Path) -> List[Dict]:
         with open(path, 'r', encoding='utf-8') as f:
@@ -168,19 +184,24 @@ class DataLoader:
         return slides
 
     @staticmethod
-    def load_image_vectors(path: Path) -> Dict[str, List[float]]:
-        """slide_id → image_vector 매핑"""
+    def load_slide_structures(path: Path) -> Dict[str, str]:
+        """slide_id → t1_structure 매핑 (Stage 1 출력에서 로드)"""
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        vectors = {}
+        structures = {}
         for slide in data.get('slides', []):
             slide_id = slide.get('slide_id')
-            if slide_id and slide.get('image_vector'):
-                vectors[slide_id] = slide['image_vector']
+            structure = slide.get('t1_structure', '')
+            if slide_id:
+                structures[slide_id] = structure
 
-        logger.info(f"✓ Loaded {len(vectors)} image vectors")
-        return vectors
+        has_structure = sum(1 for v in structures.values() if v)
+        logger.info(
+            f"✓ Loaded {len(structures)} slide structures "
+            f"({has_structure} with diagram/table info)"
+        )
+        return structures
 
 
 # ============================================================================ #
@@ -188,21 +209,16 @@ class DataLoader:
 # ============================================================================ #
 
 class ConceptRelationExtractor:
-    """t3에서 개념과 관계 추출"""
+    """t3 + t1_structure에서 개념과 관계 추출"""
 
     def __init__(self, config: Config):
         self.config = config
-        genai.configure(api_key=config.google_api_key)
-        self.model = genai.GenerativeModel(config.gemini_model)
-        logger.info(f"✓ Gemini initialized for extraction")
+        self.client = genai.Client(api_key=config.google_api_key)
+        logger.info("✓ Gemini initialized for extraction")
 
-    # ------------------------------------------------------------------
-    # [FIX 1] JSON 정제 헬퍼
-    # ------------------------------------------------------------------
     @staticmethod
     def _sanitize_response(text: str) -> str:
         """Gemini 응답에서 JSON 블록만 추출하고 기본 정제 수행"""
-        # 마크다운 코드 블록 제거
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
         elif "```" in text:
@@ -210,13 +226,9 @@ class ConceptRelationExtractor:
 
         text = text.strip()
 
-        # evidence 값 내부의 개행·탭·제어문자를 공백으로 치환
-        # JSON string value 내부만 타겟: "evidence": "...<개행>..."
         def clean_string_value(m):
             inner = m.group(1)
-            # 개행, 탭, 제어문자 → 공백
             inner = re.sub(r'[\n\r\t]', ' ', inner)
-            # 연속 공백 정리
             inner = re.sub(r' {2,}', ' ', inner).strip()
             return f'"{inner}"'
 
@@ -225,19 +237,12 @@ class ConceptRelationExtractor:
 
     @staticmethod
     def _parse_json_robust(text: str) -> dict:
-        """
-        JSON 파싱 3단계 시도:
-          1. 표준 json.loads
-          2. json_repair (available 시)
-          3. concepts/relations 각각 수동 추출 후 fallback
-        """
-        # 1차: 표준 파싱
+        """JSON 파싱 3단계: 표준 → json_repair → 정규식 fallback"""
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # 2차: json_repair
         if JSON_REPAIR_AVAILABLE:
             try:
                 repaired = repair_json(text)
@@ -247,7 +252,6 @@ class ConceptRelationExtractor:
             except Exception:
                 pass
 
-        # 3차: 정규식으로 concepts 배열만이라도 구출
         concepts = []
         relations = []
 
@@ -258,7 +262,6 @@ class ConceptRelationExtractor:
             except Exception:
                 pass
 
-        # relations는 파싱 실패 시 빈 리스트로 처리 (개념이라도 확보)
         relations_match = re.search(r'"relations"\s*:\s*(\[.*?\])', text, re.DOTALL)
         if relations_match:
             try:
@@ -272,29 +275,28 @@ class ConceptRelationExtractor:
 
         raise ValueError("JSON parsing failed after all fallback attempts")
 
-    # ------------------------------------------------------------------
-    # [FIX 3] 재시도 로직을 포함한 Gemini 호출
-    # ------------------------------------------------------------------
-    def _call_gemini(self, prompt: str, image=None) -> str:
+    def _call_gemini(self, prompt: str, image: Optional[Image.Image] = None) -> str:
+        """재시도 로직 포함 Gemini 호출"""
         last_exc = None
         for attempt in range(self.config.max_retries):
             try:
-                if image is not None:
-                    response = self.model.generate_content([prompt, image])
-                else:
-                    response = self.model.generate_content(prompt)
+                contents = [prompt, image] if image is not None else [prompt]
+                response = self.client.models.generate_content(
+                    model=self.config.gemini_model,
+                    contents=contents
+                )
                 return response.text
             except Exception as e:
                 last_exc = e
-                # 500 서버 오류 또는 네트워크 오류 → 재시도
                 logger.warning(
-                    f"  ⚠ Gemini call failed (attempt {attempt+1}/{self.config.max_retries}): {e}"
+                    f"  ⚠ Gemini call failed "
+                    f"(attempt {attempt+1}/{self.config.max_retries}): {e}"
                 )
                 if attempt < self.config.max_retries - 1:
                     time.sleep(self.config.retry_delay * (attempt + 1))
         raise last_exc
 
-    def extract(self, slide: Dict) -> Dict:
+    def extract(self, slide: Dict, structure: str = "") -> Dict:
         """단일 슬라이드에서 개념/관계 추출"""
         t3 = slide.get("t3", "")
 
@@ -306,54 +308,68 @@ class ConceptRelationExtractor:
         slide_num = slide.get("slide_number", "?")
         title = slide.get("title", "제목 없음")
 
+        slide.setdefault("concepts", [])
+        slide.setdefault("relations", [])
+
         try:
             prompt = EXTRACTION_PROMPT.format(
                 slide_num=slide_num,
                 title=title,
-                content=t3
+                content=t3,
+                # t1_structure를 프롬프트에 주입 — 비어있으면 "(없음)"으로 표시
+                structure=structure.strip() if structure.strip() else "(없음)"
             )
+
             image_path = slide.get("image_path")
             image = None
             if image_path and Path(image_path).exists():
                 image = Image.open(image_path).convert("RGB")
 
-            # [FIX 3] 재시도 포함 호출
             raw_text = self._call_gemini(prompt, image)
-
-            # [FIX 1] 정제 후 robust 파싱
             cleaned = self._sanitize_response(raw_text)
             result = self._parse_json_robust(cleaned)
 
-            # 관계 타입 검증 및 자기참조 제거
+            concepts = result.get("concepts", [])
+            concepts_set = set(c.strip() for c in concepts)  # hallucination 필터용
+
+            # 1차 검증: 관계 타입, 자기참조, 빈 evidence 필터
+            # 2차 검증: from/to가 이 슬라이드의 concepts 안에 없으면 제거
+            # → LLM이 concepts에 없는 개념을 relation에서 만들어내는 hallucination 방지
             relations = [
                 r for r in result.get("relations", [])
                 if r.get("type") in RELATION_TYPES
-                and r.get("from") and r.get("to")
+                and r.get("from", "").strip()
+                and r.get("to", "").strip()
                 and r.get("from") != r.get("to")
+                and r.get("evidence", "").strip()       # evidence 빈 문자열 관계 제거
+                and r.get("from") in concepts_set       # concepts에 없는 from 제거
+                and r.get("to") in concepts_set         # concepts에 없는 to 제거
             ]
 
-            slide["concepts"] = result.get("concepts", [])
+            slide["concepts"] = concepts
             slide["relations"] = relations
 
         except Exception as e:
             logger.error(f"  ✗ Extraction failed for slide {slide_num}: {e}")
-            slide["concepts"] = []
-            slide["relations"] = []
 
         return slide
 
-    def extract_batch(self, slides: List[Dict]) -> List[Dict]:
+    def extract_batch(
+        self, slides: List[Dict], structures: Dict[str, str]
+    ) -> List[Dict]:
         logger.info(f"Extracting concepts/relations from {len(slides)} slides...")
 
         for i, slide in enumerate(slides):
-            self.extract(slide)
+            slide_id = slide.get("slide_id", "")
+            structure = structures.get(slide_id, "")
+            self.extract(slide, structure)
             logger.info(
                 f"  [{i+1}/{len(slides)}] Slide {slide.get('slide_number')} "
                 f"「{slide.get('title', '')}」: "
                 f"{len(slide['concepts'])} concepts, {len(slide['relations'])} relations"
             )
 
-        logger.info(f"✓ Extraction complete")
+        logger.info("✓ Extraction complete")
         return slides
 
 
@@ -362,9 +378,10 @@ class ConceptRelationExtractor:
 # ============================================================================ #
 
 class ConceptNormalizer:
-    """개념 이름 정규화"""
+    """개념 이름 정규화 — 동의어 사전은 외부 JSON 파일에서 로드"""
 
-    SYNONYMS = {
+    # synonyms_path가 없을 때 사용하는 기본 사전
+    DEFAULT_SYNONYMS: Dict[str, List[str]] = {
         "시스템 호출": ["system call", "시스템콜", "syscall"],
         "운영체제": ["operating system", "OS", "os"],
         "프로세스": ["process", "프로세서"],
@@ -372,20 +389,31 @@ class ConceptNormalizer:
         "메모리": ["memory", "RAM", "ram"],
     }
 
-    def __init__(self):
-        self.reverse_map = {}
-        for canonical, variants in self.SYNONYMS.items():
+    def __init__(self, synonyms_path: Optional[Path] = None):
+        synonyms = self.DEFAULT_SYNONYMS
+
+        # 외부 파일이 있으면 덮어씀 — 강의별 사전으로 교체 가능
+        if synonyms_path and Path(synonyms_path).exists():
+            try:
+                with open(synonyms_path, 'r', encoding='utf-8') as f:
+                    synonyms = json.load(f)
+                logger.info(f"✓ Loaded synonyms from {synonyms_path} ({len(synonyms)} entries)")
+            except Exception as e:
+                logger.warning(f"  ⚠ Failed to load synonyms file: {e}. Using defaults.")
+        else:
+            logger.info(f"✓ Using default synonyms ({len(synonyms)} entries)")
+
+        self.reverse_map: Dict[str, str] = {}
+        for canonical, variants in synonyms.items():
             for v in variants:
                 self.reverse_map[v.lower()] = canonical
 
     def normalize(self, concept: str) -> str:
         concept = concept.strip()
 
-        # 괄호 내용 제거
         if '(' in concept:
             concept = concept.split('(')[0].strip()
 
-        # 동의어 통일
         lower = concept.lower()
         if lower in self.reverse_map:
             return self.reverse_map[lower]
@@ -400,8 +428,8 @@ class ConceptNormalizer:
 class KnowledgeGraphBuilder:
     """통합 지식그래프 구축"""
 
-    def __init__(self):
-        self.normalizer = ConceptNormalizer()
+    def __init__(self, synonyms_path: Optional[Path] = None):
+        self.normalizer = ConceptNormalizer(synonyms_path)
 
     def _ensure_concept(
         self,
@@ -411,7 +439,6 @@ class KnowledgeGraphBuilder:
         text_vector,
         image_vector
     ):
-        """concept_data에 개념 노드가 없으면 초기화하고 슬라이드/벡터 추가"""
         if concept not in concept_data:
             concept_data[concept] = {
                 "slides": [],
@@ -424,11 +451,7 @@ class KnowledgeGraphBuilder:
         if image_vector:
             concept_data[concept]["image_vectors"].append(image_vector)
 
-    def build(
-        self,
-        slides: List[Dict],
-        image_vectors: Dict[str, List[float]]
-    ) -> Dict:
+    def build(self, slides: List[Dict]) -> Dict:
         """
         그래프 구축
 
@@ -438,43 +461,47 @@ class KnowledgeGraphBuilder:
                     {
                         "id": "concept_name",
                         "type": "concept",
-                        "slides": [slide_ids],
-                        "text_vector": [...],   # 등장 슬라이드 text_vector 평균
-                        "image_vector": [...]   # 등장 슬라이드 image_vector 평균
+                        "slide_ids": [slide_ids],  # 등장한 슬라이드 목록
+                        "frequency": N,
+                        "text_vector": [...]
                     },
                     {
                         "id": "slide_001",
                         "type": "slide",
                         "title": "...",
-                        "text_vector": [...],
-                        "image_vector": [...]
+                        "timestamp": ...,
+                        "has_audio": bool,         # Stage 2 신규 필드
+                        "t2_coverage": N,          # Stage 2 신규 필드
+                        "text_vector": [...]
                     }
                 ],
                 "edges": [
-                    {"from": "A", "to": "B", "type": "uses", "weight": 1}
+                    {
+                        "from": "A", "to": "B", "type": "uses",
+                        "weight": N,               # 등장 횟수 누적
+                        "slide_ids": [...],        # 등장한 슬라이드 목록
+                        "evidence": "..."          # 첫 등장 슬라이드의 evidence
+                    }
                 ]
             }
         """
-        concept_data = {}  # concept → {slides, text_vectors, image_vectors}
-        edges = []
-        edge_set = set()
+        concept_data = {}
+        # 관계 중복 제거 + weight 누적을 위한 맵
+        # key: (from, to, type) → {weight, slide_ids, evidence}
+        edge_map: Dict[Tuple, Dict] = {}
 
-        # 슬라이드별 처리
         for slide in slides:
             slide_id = slide["slide_id"]
             text_vector = slide.get("text_vector")
-            image_vector = image_vectors.get(slide_id)
 
-            # 개념 수집 (concepts 리스트 기반)
+            # concepts 리스트 기반 노드 수집
             for concept in slide.get("concepts", []):
                 normalized = self.normalizer.normalize(concept)
                 if not normalized:
                     continue
-                self._ensure_concept(
-                    concept_data, normalized, slide_id, text_vector, image_vector
-                )
+                self._ensure_concept(concept_data, normalized, slide_id, text_vector, None)
 
-            # 관계 수집
+            # 관계 수집 — weight 누적
             for rel in slide.get("relations", []):
                 from_concept = self.normalizer.normalize(rel.get("from", ""))
                 to_concept = self.normalizer.normalize(rel.get("to", ""))
@@ -483,24 +510,22 @@ class KnowledgeGraphBuilder:
                 if not from_concept or not to_concept or from_concept == to_concept:
                     continue
 
-                # [FIX 2] 엣지의 from/to 개념이 concepts에 없더라도 노드로 등록
-                self._ensure_concept(
-                    concept_data, from_concept, slide_id, text_vector, image_vector
-                )
-                self._ensure_concept(
-                    concept_data, to_concept, slide_id, text_vector, image_vector
-                )
+                # 관계에 등장하는 개념도 노드로 보장
+                self._ensure_concept(concept_data, from_concept, slide_id, text_vector, None)
+                self._ensure_concept(concept_data, to_concept, slide_id, text_vector, None)
 
                 edge_key = (from_concept, to_concept, rel_type)
-                if edge_key not in edge_set:
-                    edge_set.add(edge_key)
-                    edges.append({
-                        "from": from_concept,
-                        "to": to_concept,
-                        "type": rel_type,
-                        "slide_id": slide_id,
+                if edge_key not in edge_map:
+                    # 첫 등장 시 evidence 기록
+                    edge_map[edge_key] = {
+                        "weight": 1,
+                        "slide_ids": [slide_id],
                         "evidence": rel.get("evidence", "")
-                    })
+                    }
+                else:
+                    # 재등장 시 weight 누적, slide_ids 추가
+                    edge_map[edge_key]["weight"] += 1
+                    edge_map[edge_key]["slide_ids"].append(slide_id)
 
         # 노드 생성
         nodes = []
@@ -510,23 +535,15 @@ class KnowledgeGraphBuilder:
             node = {
                 "id": concept,
                 "type": "concept",
-                "slides": list(set(data["slides"])),
-                "frequency": len(data["slides"])
+                "slide_ids": list(set(data["slides"])),
+                "frequency": len(set(data["slides"]))  # 중복 슬라이드 제외한 실제 등장 슬라이드 수
             }
-
-            # 텍스트 벡터 평균
             if data["text_vectors"]:
-                import numpy as np
                 node["text_vector"] = np.mean(data["text_vectors"], axis=0).tolist()
-
-            # 이미지 벡터 평균
-            if data["image_vectors"]:
-                import numpy as np
-                node["image_vector"] = np.mean(data["image_vectors"], axis=0).tolist()
 
             nodes.append(node)
 
-        # 슬라이드 노드
+        # 슬라이드 노드 — Stage 2 신규 필드 포함
         for slide in slides:
             slide_id = slide["slide_id"]
             node = {
@@ -534,32 +551,44 @@ class KnowledgeGraphBuilder:
                 "type": "slide",
                 "slide_number": slide["slide_number"],
                 "title": slide.get("title", ""),
-                "timestamp": slide.get("timestamp", 0)
+                "timestamp": slide.get("timestamp", 0),
+                "timestamp_end": slide.get("timestamp_end", 0),
+                # Stage 2에서 추가된 오디오 매칭 품질 필드
+                "has_audio": slide.get("has_audio", False),
+                "t2_coverage": slide.get("t2_coverage", 0),
             }
-
             if slide.get("text_vector"):
                 node["text_vector"] = slide["text_vector"]
 
-            if image_vectors.get(slide_id):
-                node["image_vector"] = image_vectors[slide_id]
-
             nodes.append(node)
 
-        # 슬라이드 ↔ 개념 연결
+        # 엣지 생성
+        edges = []
+        for (from_c, to_c, rel_type), data in edge_map.items():
+            edges.append({
+                "from": from_c,
+                "to": to_c,
+                "type": rel_type,
+                "weight": data["weight"],
+                "slide_ids": data["slide_ids"],
+                "evidence": data["evidence"]
+            })
+
+        # 슬라이드 ↔ 개념 contains 엣지
         for concept, data in concept_data.items():
             for slide_id in set(data["slides"]):
                 edges.append({
                     "from": slide_id,
                     "to": concept,
-                    "type": "contains"
+                    "type": "contains",
+                    "weight": 1,
+                    "slide_ids": [slide_id],
+                    "evidence": ""
                 })
 
         logger.info(f"✓ Built graph: {len(nodes)} nodes, {len(edges)} edges")
 
-        return {
-            "nodes": nodes,
-            "edges": edges
-        }
+        return {"nodes": nodes, "edges": edges}
 
 
 # ============================================================================ #
@@ -588,21 +617,19 @@ class GraphVisualizer:
             spring_length=200
         )
 
-        # min-max 정규화를 위한 frequency 범위 계산
         frequencies = [n.get("frequency", 1) for n in graph["nodes"] if n["type"] == "concept"]
         freq_min = min(frequencies) if frequencies else 1
         freq_max = max(frequencies) if frequencies else 1
         freq_range = freq_max - freq_min if freq_max != freq_min else 1
 
-        # 노드 추가
         for node in graph["nodes"]:
             node_id = node["id"]
             node_type = node["type"]
 
             if node_type == "concept":
                 freq = node.get("frequency", 1)
-                normalized = (freq - freq_min) / freq_range  # 0~1
-                size = 10 + normalized * 30  # 최소 10, 최대 40
+                normalized = (freq - freq_min) / freq_range
+                size = 10 + normalized * 30
                 net.add_node(
                     node_id,
                     label=node_id,
@@ -611,16 +638,22 @@ class GraphVisualizer:
                     title=f"개념: {node_id}\n등장: {node.get('frequency', 1)}회"
                 )
             else:  # slide
+                has_audio = node.get("has_audio", False)
+                # 오디오 없는 슬라이드는 색상으로 구분
+                color = "#ff8a65" if has_audio else "#b0bec5"
                 net.add_node(
                     node_id,
                     label=f"Slide {node.get('slide_number', '?')}",
-                    color="#ff8a65",
+                    color=color,
                     size=20,
                     shape="box",
-                    title=f"{node.get('title', '')}\n{node_id}"
+                    title=(
+                        f"{node.get('title', '')}\n"
+                        f"오디오: {'있음' if has_audio else '없음'} "
+                        f"({node.get('t2_coverage', 0)}개 세그먼트)"
+                    )
                 )
 
-        # 엣지 색상
         edge_colors = {
             "is_a": "#81c784",
             "part_of": "#64b5f6",
@@ -636,15 +669,17 @@ class GraphVisualizer:
             "optimizes": "#dce775"
         }
 
-        # 엣지 추가
         for edge in graph["edges"]:
             color = edge_colors.get(edge["type"], "#ffffff")
+            # weight를 엣지 두께로 반영
+            width = 1 + min(edge.get("weight", 1) - 1, 4)
             net.add_edge(
                 edge["from"],
                 edge["to"],
                 color=color,
-                title=edge["type"],
-                arrows="to"
+                title=f"{edge['type']} (×{edge.get('weight', 1)})",
+                arrows="to",
+                width=width
             )
 
         net.save_graph(str(output_path))
@@ -668,8 +703,10 @@ class GraphPipeline:
         print("🕸️ 지식그래프 생성 파이프라인 (Stage 3)")
         print("="*70)
         print(f"📄 Text: {self.config.integrated_text_json}")
-        print(f"🖼️ Image: {self.config.slide_extracted_json}")
+        print(f"🖼️  Slide: {self.config.slide_extracted_json}")
         print(f"📂 Output: {self.config.output_dir}")
+        if self.config.synonyms_path:
+            print(f"📖 Synonyms: {self.config.synonyms_path}")
 
         # Stage 1: 데이터 로드
         print("\n" + "-"*70)
@@ -677,7 +714,7 @@ class GraphPipeline:
         print("-"*70)
 
         slides = DataLoader.load_integrated_text(self.config.integrated_text_json)
-        image_vectors = DataLoader.load_image_vectors(self.config.slide_extracted_json)
+        structures = DataLoader.load_slide_structures(self.config.slide_extracted_json)
 
         # Stage 2: 개념/관계 추출
         print("\n" + "-"*70)
@@ -685,38 +722,38 @@ class GraphPipeline:
         print("-"*70)
 
         extractor = ConceptRelationExtractor(self.config)
-        slides = extractor.extract_batch(slides)
+        slides = extractor.extract_batch(slides, structures)
 
         # Stage 3: 그래프 구축
         print("\n" + "-"*70)
         print("Stage 3: 그래프 구축")
         print("-"*70)
 
-        builder = KnowledgeGraphBuilder()
-        graph = builder.build(slides, image_vectors)
+        builder = KnowledgeGraphBuilder(self.config.synonyms_path)
+        graph = builder.build(slides)
 
         # Stage 4: 결과 저장
         print("\n" + "-"*70)
         print("Stage 4: 결과 저장")
         print("-"*70)
 
-        # 통계
         concept_nodes = [n for n in graph["nodes"] if n["type"] == "concept"]
         slide_nodes = [n for n in graph["nodes"] if n["type"] == "slide"]
         concept_edges = [e for e in graph["edges"] if e["type"] != "contains"]
+        audio_less = [n for n in slide_nodes if not n.get("has_audio", False)]
 
         result = {
             "metadata": {
                 "processing_time": time.time() - start_time,
                 "total_concepts": len(concept_nodes),
                 "total_slides": len(slide_nodes),
-                "total_relations": len(concept_edges)
+                "total_relations": len(concept_edges),
+                "slides_without_audio": len(audio_less),
             },
             "graph": graph,
             "slides": slides
         }
 
-        # JSON 저장
         output_path = self.config.output_dir / "knowledge_graph.json"
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
@@ -738,13 +775,11 @@ class GraphPipeline:
             json.dump(result_light, f, indent=2, ensure_ascii=False)
         logger.info(f"✓ Saved (light): {light_path}")
 
-        # 시각화
         if PYVIS_AVAILABLE:
             visualizer = GraphVisualizer()
             viz_path = self.config.output_dir / "knowledge_graph.html"
             visualizer.visualize(graph, viz_path)
 
-        # 완료 리포트
         total_time = time.time() - start_time
         print("\n" + "="*70)
         print("✅ 그래프 생성 완료!")
@@ -753,12 +788,13 @@ class GraphPipeline:
         print(f"  • 개념 노드: {len(concept_nodes)}개")
         print(f"  • 슬라이드 노드: {len(slide_nodes)}개")
         print(f"  • 관계 (개념↔개념): {len(concept_edges)}개")
+        print(f"  • 오디오 없는 슬라이드: {len(audio_less)}개")
         print(f"\n📁 생성된 파일:")
         print(f"  • {output_path}")
         print(f"  • {light_path}")
         if PYVIS_AVAILABLE:
             print(f"  • {self.config.output_dir / 'knowledge_graph.html'}")
-        print(f"\n⏱️ 처리 시간: {total_time:.2f}초")
+        print(f"\n⏱️  처리 시간: {total_time:.2f}초")
 
         return result
 
@@ -772,15 +808,20 @@ def main():
 
     parser = argparse.ArgumentParser(description="지식그래프 생성")
     parser.add_argument("-t", "--text", default="./output/integrated_text.json")
-    parser.add_argument("-i", "--image", default="./output/slide_extracted.json")
+    parser.add_argument("-s", "--slide", default="./output/slide_extracted.json")
     parser.add_argument("-o", "--output", default="./output")
+    parser.add_argument(
+        "--synonyms", default=None,
+        help="동의어 사전 JSON 경로 (없으면 기본 사전 사용)"
+    )
 
     args = parser.parse_args()
 
     config = Config(
         integrated_text_json=Path(args.text),
-        slide_extracted_json=Path(args.image),
-        output_dir=Path(args.output)
+        slide_extracted_json=Path(args.slide),
+        output_dir=Path(args.output),
+        synonyms_path=Path(args.synonyms) if args.synonyms else None,
     )
 
     if not config.integrated_text_json.exists():
@@ -788,7 +829,7 @@ def main():
         return
 
     if not config.slide_extracted_json.exists():
-        print(f"❌ Image JSON not found: {config.slide_extracted_json}")
+        print(f"❌ Slide JSON not found: {config.slide_extracted_json}")
         return
 
     pipeline = GraphPipeline(config)

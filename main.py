@@ -1,7 +1,7 @@
 """
 실행 순서:
   Stage 0: 영상 → 슬라이드 이미지 추출         (main_0.py  - MSESlideDetector)
-  Stage 1: 슬라이드 이미지 → t1 + image_vector  (video_extract.py - ExtractionPipeline)
+  Stage 1: 슬라이드 이미지 → t1 + t1_structure  (video_extract.py - ExtractionPipeline)
   Stage 2: t1 + t2(오디오) → t3 + text_vector   (integrate_text.py - IntegrationPipeline)
   Stage 3: t3 + 벡터 → 지식그래프               (multimodal_graph.py - GraphPipeline)
 
@@ -9,6 +9,7 @@
   python main.py --video lecture.mp4 --audio audio.json
   python main.py --video lecture.mp4 --audio audio.json --output ./output --threshold 500
   python main.py --skip-stage0 --output ./output  # 슬라이드가 이미 있는 경우
+  python main.py --only 3 --synonyms ./cs_synonyms.json  # Stage 3만, 커스텀 동의어 사전
 """
 
 import argparse
@@ -16,9 +17,6 @@ import time
 import sys
 from pathlib import Path
 
-# ─────────────────────────────────────────────
-# 중앙 설정 로드
-# ─────────────────────────────────────────────
 from config import PipelineConfig
 
 
@@ -42,7 +40,7 @@ def run_stage0(cfg: PipelineConfig):
 
 
 def run_stage1(cfg: PipelineConfig):
-    """Stage 1: 슬라이드 이미지 → t1 텍스트 + ColPali image_vector"""
+    """Stage 1: 슬라이드 이미지 → t1 텍스트 + t1_structure"""
     print("\n" + "=" * 70)
     print("🖼️  Stage 1: 슬라이드 이미지 데이터 추출")
     print("=" * 70)
@@ -54,8 +52,6 @@ def run_stage1(cfg: PipelineConfig):
         slides_dir=Path(cfg.slides_dir),
         output_dir=Path(cfg.output_dir),
         gemini_model=cfg.gemini_model,
-        colpali_model=cfg.colpali_model,
-        device=cfg.device,
     )
 
     pipeline = ExtractionPipeline(stage_cfg)
@@ -77,13 +73,19 @@ def run_stage2(cfg: PipelineConfig):
         print(f"❌ 오디오 JSON 파일을 찾을 수 없습니다: {cfg.audio_json}")
         sys.exit(1)
 
+    # Stage 1 출력인 slide_extracted.json을 직접 읽음
     stage_cfg = Stage2Config(
         google_api_key=cfg.google_api_key,
-        slide_json=Path(cfg.output_dir) / "slide_extracted_light.json",
+        slide_json=Path(cfg.output_dir) / "slide_extracted.json",
         audio_json=Path(cfg.audio_json),
         output_dir=Path(cfg.output_dir),
         embedding_model=cfg.embedding_model,
         embedding_dim=cfg.embedding_dim,
+        alpha=cfg.alpha,
+        match_threshold=cfg.match_threshold,
+        min_segment_length=cfg.min_segment_length,
+        alpha_short_threshold=cfg.alpha_short_threshold,
+        alpha_short=cfg.alpha_short,
     )
 
     pipeline = IntegrationPipeline(stage_cfg)
@@ -107,6 +109,7 @@ def run_stage3(cfg: PipelineConfig):
         slide_extracted_json=Path(cfg.output_dir) / "slide_extracted.json",
         output_dir=Path(cfg.output_dir),
         gemini_model=cfg.gemini_model,
+        synonyms_path=Path(cfg.synonyms_path) if cfg.synonyms_path else None,
     )
 
     pipeline = GraphPipeline(stage_cfg)
@@ -143,6 +146,17 @@ def main():
         help="MSE 슬라이드 변화 감지 임계값 (기본값: 500, 권장 범위: 500~2000)"
     )
     parser.add_argument(
+        "--match-threshold",
+        type=float,
+        default=0.55,
+        help="오디오-슬라이드 매칭 최소 점수 (기본값: 0.55)"
+    )
+    parser.add_argument(
+        "--synonyms",
+        default=None,
+        help="동의어 사전 JSON 경로 (없으면 기본 사전 사용)"
+    )
+    parser.add_argument(
         "--skip-stage0",
         action="store_true",
         help="Stage 0 건너뜀 (슬라이드 이미지가 이미 slides/ 폴더에 있는 경우)"
@@ -157,33 +171,32 @@ def main():
 
     args = parser.parse_args()
 
-    # ─── 설정 구성 ───────────────────────────────
     cfg = PipelineConfig(
         video_path=args.video or "",
         audio_json=args.audio,
         output_dir=args.output,
-        # slides_dir 기본값(./slides) 사용 — Stage 0 저장 & Stage 1 읽기 공유 폴더
         mse_threshold=args.threshold,
+        match_threshold=args.match_threshold,
+        synonyms_path=args.synonyms,
     )
 
     total_start = time.time()
 
     print("\n" + "=" * 70)
-    print("🎓 GraphBrief / EduCurator - 강의 지식그래프 파이프라인")
+    print("🎓 강의 지식그래프 파이프라인")
     print("=" * 70)
     print(f"  영상  : {cfg.video_path or '(건너뜀)'}")
     print(f"  오디오: {cfg.audio_json}")
     print(f"  출력  : {cfg.output_dir}")
+    if cfg.synonyms_path:
+        print(f"  동의어: {cfg.synonyms_path}")
 
-    # ─── 스테이지 실행 ───────────────────────────
     only = args.only
 
     if only is not None:
-        # 단일 스테이지 실행
         stage_fn = {0: run_stage0, 1: run_stage1, 2: run_stage2, 3: run_stage3}
         stage_fn[only](cfg)
     else:
-        # 전체 순차 실행
         if not args.skip_stage0:
             if not cfg.video_path:
                 print("❌ --video 인자가 필요합니다. (--skip-stage0 옵션으로 건너뛸 수 있습니다)")
@@ -194,14 +207,13 @@ def main():
         run_stage2(cfg)
         run_stage3(cfg)
 
-    # ─── 최종 요약 ───────────────────────────────
     total_time = time.time() - total_start
     print("\n" + "=" * 70)
     print("🏁 전체 파이프라인 완료!")
     print("=" * 70)
     print(f"  ⏱️  총 처리 시간: {total_time:.1f}초")
     print(f"\n  📁 생성된 주요 파일:")
-    print(f"     {cfg.output_dir}/slide_extracted.json      ← t1 + image_vector")
+    print(f"     {cfg.output_dir}/slide_extracted.json      ← t1 + t1_structure")
     print(f"     {cfg.output_dir}/integrated_text.json      ← t3 + text_vector")
     print(f"     {cfg.output_dir}/knowledge_graph.json      ← 지식그래프")
     print(f"     {cfg.output_dir}/knowledge_graph.html      ← 시각화")
