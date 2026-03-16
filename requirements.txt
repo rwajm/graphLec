@@ -1,0 +1,8 @@
+groq
+google-genai
+pymupdf
+python-pptx
+python-dotenv
+librosa
+numpy
+kiwipiepy
