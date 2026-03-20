@@ -1,212 +1,224 @@
 """
-실행 순서:
-  Stage 0: 영상 → 슬라이드 이미지 추출         (main_0.py  - MSESlideDetector)
-  Stage 1: 슬라이드 이미지 → t1 + image_vector  (video_extract.py - ExtractionPipeline)
-  Stage 2: t1 + t2(오디오) → t3 + text_vector   (integrate_text.py - IntegrationPipeline)
-  Stage 3: t3 + 벡터 → 지식그래프               (multimodal_graph.py - GraphPipeline)
+main.py
+=======
+강의 영상 분석 파이프라인 전체 실행
 
-사용법:
-  python main.py --video lecture.mp4 --audio audio.json
-  python main.py --video lecture.mp4 --audio audio.json --output ./output --threshold 500
-  python main.py --skip-stage0 --output ./output  # 슬라이드가 이미 있는 경우
+단계:
+  Stage 1   : slide_extractor     — 영상에서 슬라이드/필기 프레임 추출
+  Stage 2-1  : slide_textualizer  — 슬라이드 텍스트 + 슬라이드 강조 추출 (Gemini)
+  Stage 2-2  : annotation_analyzer— 교수 필기 강조 분석 (Gemini)
+  Stage 3   : slide_integrator    — scene/slide 강조 통합 텍스트 생성
+
+Usage:
+    python main.py --input lecture.mp4
+    python main.py --input lecture.mp4 --output output/ --slides output_slides/
+    python main.py --input lecture.mp4 --skip-extract   # Stage 1 건너뜀 (이미 추출된 경우)
+    python main.py --input lecture.mp4 --debug --masks
 """
 
-import argparse
-import time
 import sys
+import time
+import argparse
+import logging
 from pathlib import Path
 
-# ─────────────────────────────────────────────
-# 중앙 설정 로드
-# ─────────────────────────────────────────────
-from config import PipelineConfig
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
 
 
-def run_stage0(cfg: PipelineConfig):
-    """Stage 0: MSE 기반 슬라이드 변화 감지 및 이미지 저장"""
-    print("\n" + "=" * 70)
-    print("🎬 Stage 0: 영상 → 슬라이드 이미지 추출")
-    print("=" * 70)
+# ──────────────────────────────────────────────
+# 유틸: 단계 구분 출력
+# ──────────────────────────────────────────────
 
-    from main_0 import MSESlideDetector
-
-    if not Path(cfg.video_path).exists():
-        print(f"❌ 영상 파일을 찾을 수 없습니다: {cfg.video_path}")
-        sys.exit(1)
-
-    detector = MSESlideDetector(cfg.video_path)
-    result = detector.run(threshold=cfg.mse_threshold, output_dir=cfg.slides_dir)
-
-    print(f"\n✅ Stage 0 완료: {result['count']}개 슬라이드 → {cfg.slides_dir}/")
-    return result
+def _banner(title: str):
+    print("\n" + "═" * 70)
+    print(f"  {title}")
+    print("═" * 70)
 
 
-def run_stage1(cfg: PipelineConfig):
-    """Stage 1: 슬라이드 이미지 → t1 텍스트 + ColPali image_vector"""
-    print("\n" + "=" * 70)
-    print("🖼️  Stage 1: 슬라이드 이미지 데이터 추출")
-    print("=" * 70)
+def _done(label: str, elapsed: float):
+    print(f"\n  ✓ {label} 완료  ({elapsed:.1f}초)")
+    print("─" * 70)
 
-    from video_extract import ExtractionPipeline, Config as Stage1Config
 
-    stage_cfg = Stage1Config(
-        google_api_key=cfg.google_api_key,
-        slides_dir=Path(cfg.slides_dir),
-        output_dir=Path(cfg.output_dir),
-        gemini_model=cfg.gemini_model,
-        colpali_model=cfg.colpali_model,
-        device=cfg.device,
+# ──────────────────────────────────────────────
+# 파이프라인
+# ──────────────────────────────────────────────
+
+def run_pipeline(args):
+    total_start = time.time()
+    timings: dict[str, float] = {}
+
+    slides_dir  = Path(args.slides)
+    output_dir  = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    textualized_path  = output_dir / "slide_textualized.json"
+    annotation_path   = output_dir / "annotation_analysis.json"
+    integrated_path   = output_dir / "slide_integrated.json"
+
+    print("\n" + "═" * 70)
+    print("  강의 영상 분석 파이프라인")
+    print("═" * 70)
+    print(f"  입력 영상 : {args.input}")
+    print(f"  슬라이드  : {slides_dir}")
+    print(f"  출력      : {output_dir}")
+
+    # ────────────────────────────────────────
+    # Stage 1: 슬라이드 추출
+    # ────────────────────────────────────────
+    if args.skip_extract:
+        log.info("Stage 1 건너뜀 (--skip-extract)")
+        timings["Stage 1 슬라이드 추출"] = 0.0
+    else:
+        _banner("Stage 1 / 4  —  슬라이드 추출  (slide_extractor)")
+        print(f"  영상: {args.input}  →  {slides_dir}/")
+
+        from slide_extractor import extract_slides
+
+        t0 = time.time()
+        metadata = extract_slides(
+            input_path=args.input,
+            output_dir=str(slides_dir),
+            debug=args.debug,
+        )
+        elapsed = time.time() - t0
+        timings["Stage 1 슬라이드 추출"] = elapsed
+
+        slide_count = len({m["slide_index"] for m in metadata})
+        frame_count = len(metadata)
+        _done(f"슬라이드 {slide_count}개, 프레임 {frame_count}개 추출", elapsed)
+
+    # ────────────────────────────────────────
+    # Stage 2-1: 슬라이드 텍스트화
+    # ────────────────────────────────────────
+    _banner("Stage 2-1 / 4  —  슬라이드 텍스트화  (slide_textualizer)")
+    print(f"  {slides_dir}/  →  {textualized_path}")
+
+    from slide_textualizer import TextualizationPipeline, Config as TextConfig
+
+    t0 = time.time()
+    text_config = TextConfig(
+        slides_dir=slides_dir,
+        output_dir=output_dir,
+        max_retries=args.retries,
     )
+    text_result = TextualizationPipeline(text_config).run()
+    elapsed = time.time() - t0
+    timings["Stage 2-1 슬라이드 텍스트화"] = elapsed
 
-    pipeline = ExtractionPipeline(stage_cfg)
-    result = pipeline.run()
+    n_slides = text_result["metadata"]["total_slides"]
+    _done(f"슬라이드 {n_slides}개 텍스트화", elapsed)
 
-    print(f"\n✅ Stage 1 완료: {cfg.output_dir}/slide_extracted.json")
-    return result
+    # ────────────────────────────────────────
+    # Stage 2-2: 필기 강조 분석
+    # ────────────────────────────────────────
+    _banner("Stage 2-2 / 4  —  필기 강조 분석  (annotation_analyzer)")
+    print(f"  {slides_dir}/  →  {annotation_path}")
 
+    from annotation_analyzer import analyze_all
 
-def run_stage2(cfg: PipelineConfig):
-    """Stage 2: t1 + 오디오 전사 → t3 통합 텍스트 + text_vector"""
-    print("\n" + "=" * 70)
-    print("🔗 Stage 2: 텍스트 통합 (슬라이드 + 오디오)")
-    print("=" * 70)
-
-    from integrate_text import IntegrationPipeline, Config as Stage2Config
-
-    if not Path(cfg.audio_json).exists():
-        print(f"❌ 오디오 JSON 파일을 찾을 수 없습니다: {cfg.audio_json}")
-        sys.exit(1)
-
-    stage_cfg = Stage2Config(
-        google_api_key=cfg.google_api_key,
-        slide_json=Path(cfg.output_dir) / "slide_extracted_light.json",
-        audio_json=Path(cfg.audio_json),
-        output_dir=Path(cfg.output_dir),
-        embedding_model=cfg.embedding_model,
-        embedding_dim=cfg.embedding_dim,
+    t0 = time.time()
+    annot_results = analyze_all(
+        slides_dir=str(slides_dir),
+        output_path=str(annotation_path),
+        save_masks=args.masks,
     )
+    elapsed = time.time() - t0
+    timings["Stage 2-2 필기 강조 분석"] = elapsed
 
-    pipeline = IntegrationPipeline(stage_cfg)
-    result = pipeline.run()
+    n_analyzed   = len(annot_results)
+    n_annots     = sum(len(r.get("annotations", [])) for r in annot_results)
+    _done(f"annot {n_analyzed}개 분석, 총 {n_annots}개 강조 추출", elapsed)
 
-    print(f"\n✅ Stage 2 완료: {cfg.output_dir}/integrated_text.json")
-    return result
+    # ────────────────────────────────────────
+    # Stage 3: 통합
+    # ────────────────────────────────────────
+    _banner("Stage 3 / 4  —  통합 텍스트 생성  (slide_integrator)")
+    print(f"  {textualized_path}")
+    print(f"  {annotation_path}")
+    print(f"  →  {integrated_path}")
+
+    from slide_integrator import IntegrationPipeline
+
+    t0 = time.time()
+    integ_result = IntegrationPipeline(
+        extracted_path=textualized_path,
+        annotated_path=annotation_path,
+        output_path=integrated_path,
+    ).run()
+    elapsed = time.time() - t0
+    timings["Stage 3 통합 텍스트 생성"] = elapsed
+
+    n_integrated = integ_result["metadata"]["total_slides"]
+    n_emphasized = integ_result["metadata"]["total_emphasized"]
+    _done(f"슬라이드 {n_integrated}개 통합, 총 {n_emphasized}개 강조", elapsed)
+
+    # ────────────────────────────────────────
+    # 최종 요약
+    # ────────────────────────────────────────
+    total_elapsed = time.time() - total_start
+
+    print("\n" + "═" * 70)
+    print("  ✅ 파이프라인 완료")
+    print("═" * 70)
+    print("\n  단계별 소요 시간:")
+    for stage, t in timings.items():
+        if t == 0.0 and "건너뜀" not in stage:
+            label = f"  (건너뜀)"
+        else:
+            label = f"  {t:>7.1f}초"
+        print(f"    {stage:<30} {label}")
+    print(f"\n    {'총 소요 시간':<30}  {total_elapsed:>7.1f}초")
+
+    print("\n  생성된 파일:")
+    for path in [textualized_path, annotation_path, integrated_path]:
+        exists = "✓" if path.exists() else "✗"
+        print(f"    {exists}  {path}")
+    print()
 
 
-def run_stage3(cfg: PipelineConfig):
-    """Stage 3: t3 + 벡터 → 지식그래프 (JSON + HTML 시각화)"""
-    print("\n" + "=" * 70)
-    print("🕸️  Stage 3: 지식그래프 생성")
-    print("=" * 70)
-
-    from multimodal_graph import GraphPipeline, Config as Stage3Config
-
-    stage_cfg = Stage3Config(
-        google_api_key=cfg.google_api_key,
-        integrated_text_json=Path(cfg.output_dir) / "integrated_text.json",
-        slide_extracted_json=Path(cfg.output_dir) / "slide_extracted.json",
-        output_dir=Path(cfg.output_dir),
-        gemini_model=cfg.gemini_model,
-    )
-
-    pipeline = GraphPipeline(stage_cfg)
-    result = pipeline.run()
-
-    print(f"\n✅ Stage 3 완료: {cfg.output_dir}/knowledge_graph.json")
-    return result
-
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="강의 영상 → 지식그래프 전체 파이프라인",
-        formatter_class=argparse.RawTextHelpFormatter,
+        description="강의 영상 분석 파이프라인",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+예시:
+  python main.py --input lecture.mp4
+  python main.py --input lecture.mp4 --output out/ --slides slides/
+  python main.py --input lecture.mp4 --skip-extract   # 슬라이드 재추출 생략
+  python main.py --input lecture.mp4 --debug --masks  # 디버그 + 마스크 저장
+        """
     )
-    parser.add_argument(
-        "-v", "--video",
-        default=None,
-        help="입력 영상 파일 경로 (예: lecture.mp4)"
-    )
-    parser.add_argument(
-        "-a", "--audio",
-        default="./audio.json",
-        help="Whisper 전사 JSON 파일 경로 (기본값: ./audio.json)"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        default="./output",
-        help="결과 저장 폴더 (기본값: ./output)"
-    )
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=500,
-        help="MSE 슬라이드 변화 감지 임계값 (기본값: 500, 권장 범위: 500~2000)"
-    )
-    parser.add_argument(
-        "--skip-stage0",
-        action="store_true",
-        help="Stage 0 건너뜀 (슬라이드 이미지가 이미 slides/ 폴더에 있는 경우)"
-    )
-    parser.add_argument(
-        "--only",
-        type=int,
-        choices=[0, 1, 2, 3],
-        default=None,
-        help="특정 스테이지만 실행 (0/1/2/3)"
-    )
+    parser.add_argument("--input",  "-i", required=True,
+                        help="입력 강의 영상 경로 (.mp4)")
+    parser.add_argument("--slides", "-s", default="./output_slides",
+                        help="슬라이드 프레임 저장 디렉토리 (default: ./output_slides)")
+    parser.add_argument("--output", "-o", default="./output",
+                        help="분석 결과 저장 디렉토리 (default: ./output)")
+    parser.add_argument("--skip-extract", action="store_true",
+                        help="Stage 1 건너뜀 — 이미 슬라이드가 추출된 경우")
+    parser.add_argument("--retries", type=int, default=3,
+                        help="Gemini API 재시도 횟수 (default: 3)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Stage 1 디버그 로그 출력")
+    parser.add_argument("--masks", action="store_true",
+                        help="Stage 2-2 diff 마스크 이미지 저장")
 
     args = parser.parse_args()
 
-    # ─── 설정 구성 ───────────────────────────────
-    cfg = PipelineConfig(
-        video_path=args.video or "",
-        audio_json=args.audio,
-        output_dir=args.output,
-        # slides_dir 기본값(./slides) 사용 — Stage 0 저장 & Stage 1 읽기 공유 폴더
-        mse_threshold=args.threshold,
-    )
+    if not args.skip_extract and not Path(args.input).exists():
+        print(f"❌ 입력 영상 없음: {args.input}")
+        sys.exit(1)
 
-    total_start = time.time()
-
-    print("\n" + "=" * 70)
-    print("🎓 GraphBrief / EduCurator - 강의 지식그래프 파이프라인")
-    print("=" * 70)
-    print(f"  영상  : {cfg.video_path or '(건너뜀)'}")
-    print(f"  오디오: {cfg.audio_json}")
-    print(f"  출력  : {cfg.output_dir}")
-
-    # ─── 스테이지 실행 ───────────────────────────
-    only = args.only
-
-    if only is not None:
-        # 단일 스테이지 실행
-        stage_fn = {0: run_stage0, 1: run_stage1, 2: run_stage2, 3: run_stage3}
-        stage_fn[only](cfg)
-    else:
-        # 전체 순차 실행
-        if not args.skip_stage0:
-            if not cfg.video_path:
-                print("❌ --video 인자가 필요합니다. (--skip-stage0 옵션으로 건너뛸 수 있습니다)")
-                sys.exit(1)
-            run_stage0(cfg)
-
-        run_stage1(cfg)
-        run_stage2(cfg)
-        run_stage3(cfg)
-
-    # ─── 최종 요약 ───────────────────────────────
-    total_time = time.time() - total_start
-    print("\n" + "=" * 70)
-    print("🏁 전체 파이프라인 완료!")
-    print("=" * 70)
-    print(f"  ⏱️  총 처리 시간: {total_time:.1f}초")
-    print(f"\n  📁 생성된 주요 파일:")
-    print(f"     {cfg.output_dir}/slide_extracted.json      ← t1 + image_vector")
-    print(f"     {cfg.output_dir}/integrated_text.json      ← t3 + text_vector")
-    print(f"     {cfg.output_dir}/knowledge_graph.json      ← 지식그래프")
-    print(f"     {cfg.output_dir}/knowledge_graph.html      ← 시각화")
-    print(f"\n  💬 Q&A 실행:")
-    print(f"     python graph_qa.py -g {cfg.output_dir}/knowledge_graph.json")
+    run_pipeline(args)
 
 
 if __name__ == "__main__":

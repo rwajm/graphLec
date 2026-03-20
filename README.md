@@ -38,7 +38,7 @@ audio.json   ──┤
 | `main.py` | 전체 파이프라인 순차 실행 진입점 |
 | `config.py` | 모든 스테이지의 공통 설정값 관리 |
 | `main_0.py` | MSE 기반 슬라이드 변화 감지 및 이미지 저장 |
-| `video_extract.py` | Gemini Vision으로 슬라이드 텍스트(t1) 추출 + ColPali 이미지 벡터화 |
+| `video_extract.py` | Gemini Vision으로 슬라이드 텍스트(t1) 추출 |
 | `integrate_text.py` | 슬라이드(t1)와 오디오 전사(t2)를 타임스탬프 기준으로 통합(t3) + Gemini 임베딩 |
 | `multimodal_graph.py` | t3 기반 개념/관계 추출 → 지식그래프 구축 및 시각화 |
 | `graph_qa.py` | 지식그래프 기반 Q&A 시스템 |
@@ -79,7 +79,7 @@ audio.json   ──┤
 |------|-------------|------|
 | `output/slide_NNN_Xs.jpg` | Stage 0 | 감지된 슬라이드 이미지 |
 | `output/report.txt` | Stage 0 | 슬라이드 감지 리포트 (타임스탬프 목록) |
-| `output/slide_extracted.json` | Stage 1 | t1(슬라이드 텍스트) + image_vector(ColPali) |
+| `output/slide_extracted.json` | Stage 1 | t1(슬라이드 텍스트) |
 | `output/slide_extracted_light.json` | Stage 1 | 벡터 제외 경량 버전 |
 | `output/integrated_text.json` | Stage 2 | t3(통합 텍스트) + text_vector(Gemini 임베딩) |
 | `output/integrated_text_light.json` | Stage 2 | 벡터 제외 경량 버전 |
@@ -200,7 +200,6 @@ Pillow>=10.0.0
 google-generativeai>=0.8.0
 google-genai>=0.8.0
 torch>=2.0.0
-colpali-engine>=0.3.0
 transformers>=4.40.0
 pyvis>=0.3.2
 python-dotenv>=1.0.0

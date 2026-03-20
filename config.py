@@ -12,6 +12,7 @@ API 키는 환경변수로 관리하는 것을 권장합니다.
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 # ─── python-dotenv 지원 (선택적) ─────────────────────────────────────────────
 try:
@@ -31,30 +32,20 @@ except ImportError:
 #   Pillow>=10.0.0                # 이미지 처리
 #
 # [Gemini API]
-#   google-generativeai>=0.8.0    # Gemini Vision / 텍스트 추출 (Stage 1, 2, 3)
-#   google-genai>=0.8.0           # Gemini Embedding (Stage 2, Q&A)
-#
-# [ColPali - 이미지 벡터화]
-#   torch>=2.0.0                  # PyTorch (Stage 1)
-#   colpali-engine>=0.3.0         # ColPali 모델 (Stage 1)
-#   transformers>=4.40.0          # HuggingFace 모델 로더
+#   google-genai>=0.8.0           # Gemini Vision / Embedding / 텍스트 추출
 #
 # [Graph]
 #   pyvis>=0.3.2                  # 지식그래프 HTML 시각화 (Stage 3)
 #
 # [Optional]
 #   python-dotenv>=1.0.0          # .env 파일 지원
-#
-# GPU 사용 시 CUDA 버전에 맞는 PyTorch 설치 필요:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+#   json-repair>=0.1.0            # LLM JSON 응답 복구 (Stage 3)
 # ============================================================================ #
 
 
 @dataclass
 class PipelineConfig:
     """전체 파이프라인 통합 설정"""
-
-    alpha: float = 0.4  # 타임스탬프 가중치 (1-alpha = 임베딩 가중치)
 
     # ─── API 키 ──────────────────────────────────────────────────────────────
     google_api_key: str = field(
@@ -79,34 +70,40 @@ class PipelineConfig:
     mse_sample_rate: float = 0.5
     # 프레임 샘플링 간격 (초). 0.5 = 초당 2프레임 검사
 
-    # ─── Stage 1: 슬라이드 텍스트/벡터 추출 ──────────────────────────────────
+    # ─── Stage 1: 슬라이드 텍스트 추출 ──────────────────────────────────────
     gemini_model: str = "models/gemini-2.5-flash"
     # t1 추출 및 개념/관계 추출에 사용할 Gemini 모델
 
-    colpali_model: str = "vidore/colpali-v1.2"
-    # ColPali 이미지 벡터화 모델 (HuggingFace)
-
-    device: str = "cuda"
-    # ColPali 연산 디바이스. GPU 없으면 자동으로 "cpu"로 전환됨
-
     # ─── Stage 2: 텍스트 통합 및 임베딩 ─────────────────────────────────────
     embedding_model: str = "models/gemini-embedding-001"
-    # 텍스트 벡터 생성에 사용할 Gemini Embedding 모델
-
     embedding_dim: int = 768
-    # 임베딩 벡터 차원 수
+
+    alpha: float = 0.4
+    # 타임스탬프 가중치 (1-alpha = 임베딩 가중치)
+    # 텍스트가 충분한 슬라이드에 적용되는 기본값
+
+    match_threshold: float = 0.55
+    # 오디오-슬라이드 매칭 최소 점수. 미달 세그먼트는 unmatched 처리
+
+    min_segment_length: int = 5
+    # 단문 필터 — 이 글자 수 미만 세그먼트는 매칭 스킵 (API 비용 절감)
+
+    alpha_short_threshold: int = 30
+    # 슬라이드 텍스트가 이 길이 미만이면 alpha_short 사용
+
+    alpha_short: float = 0.8
+    # 텍스트가 적은(그림 위주) 슬라이드용 alpha — 타임스탬프 비중 확대
 
     # ─── Stage 3: 지식그래프 생성 ────────────────────────────────────────────
-    # gemini_model 동일 사용 (개념/관계 추출)
-    # output: knowledge_graph.json, knowledge_graph.html
+    synonyms_path: Optional[str] = None
+    # 동의어 사전 JSON 경로 — 강의별로 교체 가능 (없으면 기본 사전 사용)
+    # 형식: {"표준명": ["동의어1", "동의어2", ...], ...}
 
     def __post_init__(self):
-        # API 키 경고
         if not self.google_api_key:
             print("⚠️  GOOGLE_API_KEY가 설정되지 않았습니다.")
             print("   환경변수를 설정하거나 config.py의 google_api_key를 직접 입력하세요.")
 
-        # 출력 폴더 생성
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         Path(self.slides_dir).mkdir(parents=True, exist_ok=True)
 
