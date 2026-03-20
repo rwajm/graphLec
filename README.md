@@ -33,10 +33,10 @@
   - `transcriber.py` — Groq Whisper 전사
   - `text_processor.py` — 텍스트 2단계 교정 + 노트 생성
   - `segment_grouper.py` — 세그먼트 그룹핑(맥락/슬라이드별)
-  - `emphasis_detector_std.py` — 오디오/키워드 기반 강조 감지
-  - `emphasis_detector_std_topic.py` — 주제 키워드 반복 + LLM 필터
-  - `emphasis_comparator.py` — 강조 결과 통합
-  - `audio_analyzer.py`, `config.py`, `utils.py` — 공용 모듈
+  - `emphasis_audio.py` — 오디오 신호 기반 강조 감지 (볼륨/피치 표준편차)
+  - `emphasis_keyword.py` — 키워드 기반 강조 감지 (가중치 키워드 + 주제 키워드 반복)
+  - `emphasis_combiner.py` — 강조 감지 결과 통합
+  - `config.py`, `utils.py` — 공용 모듈
   - `output/` — 결과 파일 출력 폴더
   - `archive/` — 예전/미사용 스크립트 보관
 
@@ -97,4 +97,3 @@ python main.py <video.mp4> [metadata.json]
 - `1장_영상_by_slide_v2.json` — 슬라이드-컨텍스트-세그먼트 + 강조 상세
 - `1장_영상_by_slide_iterative_v2.json` — 슬라이드별 iterative 병합 + 강조 요약
 - `1장_영상_notes_v2.md` — 강의 정리 노트
-

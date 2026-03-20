@@ -37,15 +37,13 @@ from transcriber import transcribe_video
 from text_processor import (
     correct_segments_dual_with_slide_context,
 )
-from emphasis_detector_std import (
-    detect_emphasis_by_std,
+from emphasis_audio import detect_emphasis_by_std
+from emphasis_keyword import (
     detect_emphasis_by_keywords_weighted,
-)
-from emphasis_detector_std_topic import (
     detect_emphasis_by_topic_keyword_repetition,
     get_topic_keywords_filtered_v2,
 )
-from emphasis_comparator import combine_emphasis_simple
+from emphasis_combiner import combine_emphasis_simple
 from segment_grouper import (
     group_segments_by_context,
     expand_group_annotations_to_segments,
