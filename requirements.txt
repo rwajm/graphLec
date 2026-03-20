@@ -1,23 +1,26 @@
-# GPU 사용 시 torch는 아래 링크에서 CUDA 버전에 맞게 먼저 설치:
+# GPU 사용 시 torch는 아래 링크에서 CUDA 버전에 맞게 먼저 설치: [cite: 1]
 #   pip install torch --index-url https://download.pytorch.org/whl/cu118
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 
-# ── Core ──────────────────────────────────────────────────────
-opencv-python>=4.8.0
-numpy>=1.24.0
-Pillow>=10.0.0
+# ── Core & Utilities ──────────────────────────────────────────
+opencv-python>=4.8.0 [cite: 1]
+numpy>=1.24.0 [cite: 1, 2]
+Pillow>=10.0.0 [cite: 1]
+python-dotenv>=1.0.0 [cite: 1, 2]
+librosa [cite: 2]
+pymupdf [cite: 2]
+python-pptx [cite: 2]
 
-# ── Gemini API ────────────────────────────────────────────────
-google-generativeai>=0.8.0
-google-genai>=0.8.0
+# ── AI & API Clients ──────────────────────────────────────────
+google-generativeai>=0.8.0 [cite: 1]
+google-genai>=0.8.0 [cite: 1, 2]
+groq [cite: 2]
 
-# ── ColPali (이미지 벡터화) ────────────────────────────────────
-torch>=2.0.0
-colpali-engine>=0.3.0
-transformers>=4.40.0
+# ── ML & Vision (ColPali) ─────────────────────────────────────
+torch>=2.0.0 [cite: 1]
+colpali-engine>=0.3.0 [cite: 1]
+transformers>=4.40.0 [cite: 1]
 
-# ── Graph 시각화 ──────────────────────────────────────────────
-pyvis>=0.3.2
-
-# ── Optional ─────────────────────────────────────────────────
-python-dotenv>=1.0.0
+# ── Text & Knowledge Graph ────────────────────────────────────
+kiwipiepy [cite: 2]
+pyvis>=0.3.2 [cite: 1]

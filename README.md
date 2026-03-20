@@ -1,227 +1,92 @@
-# GraphLec
+통합된 GraphLec 프로젝트의 README.md 파일 내용입니다. 아래 내용을 그대로 복사하여 사용하시면 됩니다.
+GraphLec: 통합 강의 분석 및 지식그래프 생성 파이프라인
 
-강의 영상을 입력으로 받아 슬라이드 이미지 추출 → 텍스트/벡터 추출 → 오디오 통합 → 지식그래프 생성까지 자동으로 처리하는 멀티모달 파이프라인입니다.
+GraphLec은 강의 영상에서 시각적 정보(슬라이드)와 청각적 정보(음성)를 결합하여, 고정밀 전사, 강조 구간 분석, 그리고 최종적인 지식그래프(Knowledge Graph)를 구축하는 멀티모달 파이프라인입니다.
 
----
+1. 주요 기능
+🎥 영상 및 슬라이드 분석
 
-## 전체 파이프라인 구조
+    슬라이드 변화 감지: MSE(Mean Squared Error) 기반으로 영상 내 슬라이드 전환 시점을 추적하여 이미지를 추출합니다.
 
-```
-lecture.mp4  ──┐
-audio.json   ──┤
-               ▼
-        ┌──────────────┐
-        │   main.py    │  전체 파이프라인 오케스트레이터
-        └──────┬───────┘
-               │
-     ┌─────────▼──────────────────────────────────────────────────┐
-     │ Stage 0  main_0.py        영상 → 슬라이드 이미지 (MSE 감지) │
-     ├─────────▼──────────────────────────────────────────────────┤
-     │ Stage 1  video_extract.py  슬라이드 → t1 텍스트 + 이미지벡터│
-     ├─────────▼──────────────────────────────────────────────────┤
-     │ Stage 2  integrate_text.py t1 + 오디오(t2) → t3 + 텍스트벡터│
-     ├─────────▼──────────────────────────────────────────────────┤
-     │ Stage 3  multimodal_graph.py t3 + 벡터 → 지식그래프         │
-     └─────────▼──────────────────────────────────────────────────┘
-               │
-        ┌──────▼───────┐
-        │  graph_qa.py │  완성된 그래프 기반 Q&A (별도 실행)
-        └──────────────┘
-```
+    시각 텍스트 추출 (t1): Gemini Vision을 사용하여 각 슬라이드의 텍스트와 이미지 벡터를 추출합니다.
 
----
+🎙️ 음성 전사 및 강조 분석
 
-## 파일 구성
+    슬라이드별 맞춤 전사: Groq Whisper(whisper-large-v3-turbo)를 사용하여 슬라이드 구간에 맞춰 오디오를 잘라 전사합니다.
 
-| 파일 | 역할 |
-|------|------|
-| `main.py` | 전체 파이프라인 순차 실행 진입점 |
-| `config.py` | 모든 스테이지의 공통 설정값 관리 |
-| `main_0.py` | MSE 기반 슬라이드 변화 감지 및 이미지 저장 |
-| `video_extract.py` | Gemini Vision으로 슬라이드 텍스트(t1) 추출 |
-| `integrate_text.py` | 슬라이드(t1)와 오디오 전사(t2)를 타임스탬프 기준으로 통합(t3) + Gemini 임베딩 |
-| `multimodal_graph.py` | t3 기반 개념/관계 추출 → 지식그래프 구축 및 시각화 |
-| `graph_qa.py` | 지식그래프 기반 Q&A 시스템 |
+    2단계 텍스트 교정:
 
----
+        1단계: 전문용어 및 오타 위주의 최소 교정을 수행합니다.
 
-## 입력 / 출력
+        2단계: 슬라이드 컨텍스트를 반영하여 추임새를 제거하고 자연스러운 문장으로 변환합니다.
 
-### 입력
+    강조 구간 탐지: 오디오 표준편차와 가중치 키워드 반복 빈도, LLM 필터를 결합하여 핵심 강의 구간을 탐지합니다.
 
-| 파일 | 설명 | 필수 여부 |
-|------|------|-----------|
-| `lecture.mp4` | 분석할 강의 영상 (mp4, avi 등 OpenCV 지원 형식) | Stage 0 필수 |
-| `audio.json` | Whisper 등으로 생성한 오디오 전사 JSON | Stage 2 필수 |
+🕸️ 지식그래프 및 Q&A
 
-**audio.json 형식 (두 가지 모두 지원)**
+    멀티모달 통합 (t3): 슬라이드 텍스트(t1)와 오디오 전사(t2)를 타임스탬프 기준으로 병합하고 임베딩합니다.
 
-```json
-// 형식 1 - segments 배열 포함
-{
-  "segments": [
-    { "start": 0.0, "end": 5.2, "text": "안녕하세요" },
-    { "start": 5.2, "end": 10.4, "text": "오늘은 운영체제에 대해 배우겠습니다" }
-  ]
-}
+    지식그래프 구축: 추출된 개념 간의 관계(is_a, uses, solves 등 12종)를 정의하고 PyVis로 시각화합니다.
 
-// 형식 2 - 최상위 배열
-[
-  { "start": 0.0, "end": 5.2, "text": "안녕하세요" }
-]
-```
+    그래프 기반 Q&A: 구축된 그래프 데이터를 바탕으로 자연어 질의응답 시스템을 제공합니다.
 
-### 출력
+2. 파이프라인 구조
+코드 스니펫
 
-모든 결과 파일은 `./output/` 폴더에 저장됩니다.
+graph TD
+    Video[강의 영상 .mp4] --> Stage0[Stage 0: 슬라이드 추출 MSE]
+    Video --> AudioPipe[음성 파이프라인: Whisper 전사]
+    
+    Stage0 --> Stage1[Stage 1: 슬라이드 텍스트 추출 t1]
+    AudioPipe --> Emphasis[강조 구간 및 키워드 분석]
+    
+    Stage1 --> Stage2[Stage 2: 텍스트/오디오 통합 t3]
+    Emphasis --> Stage2
+    
+    Stage2 --> Stage3[Stage 3: 지식그래프 생성]
+    Stage3 --> QA[Graph Q&A 서비스]
 
-| 파일 | 생성 스테이지 | 설명 |
-|------|-------------|------|
-| `output/slide_NNN_Xs.jpg` | Stage 0 | 감지된 슬라이드 이미지 |
-| `output/report.txt` | Stage 0 | 슬라이드 감지 리포트 (타임스탬프 목록) |
-| `output/slide_extracted.json` | Stage 1 | t1(슬라이드 텍스트) |
-| `output/slide_extracted_light.json` | Stage 1 | 벡터 제외 경량 버전 |
-| `output/integrated_text.json` | Stage 2 | t3(통합 텍스트) + text_vector(Gemini 임베딩) |
-| `output/integrated_text_light.json` | Stage 2 | 벡터 제외 경량 버전 |
-| `output/knowledge_graph.json` | Stage 3 | 개념 노드 + 관계 엣지 + 벡터 통합 그래프 |
-| `output/knowledge_graph_light.json` | Stage 3 | 벡터 제외 경량 버전 |
-| `output/knowledge_graph.html` | Stage 3 | PyVis 인터랙티브 그래프 시각화 |
+3. 설치 및 설정
+패키지 설치
+Bash
 
----
-
-## 설치
-
-### 1. 저장소 클론
-
-```bash
-git clone https://github.com/your-repo/graphlec.git
-cd graphlec
-```
-
-### 2. 가상환경 생성 (권장)
-
-```bash
-python -m venv venv
-source venv/bin/activate        # Linux/Mac
-venv\Scripts\activate           # Windows
-```
-
-### 3. 패키지 설치
-
-```bash
 pip install -r requirements.txt
-```
 
-GPU 사용 시 PyTorch를 CUDA 버전에 맞게 먼저 설치하세요:
+환경 변수 설정
 
-```bash
-# CUDA 11.8
-pip install torch --index-url https://download.pytorch.org/whl/cu118
+.env 파일에 다음 API 키를 설정해야 합니다:
 
-# CUDA 12.1
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-```
+    GROQ_API_KEY: 고속 Whisper 전사 서비스용.
 
-### 4. API 키 설정
+    GOOGLE_API_KEY (또는 GEMINI_API_KEY): Gemini Vision 및 임베딩용.
 
-```bash
-# 환경변수로 설정 (권장)
-export GOOGLE_API_KEY="your_api_key_here"
+4. 사용법
+전체 실행
+Bash
 
-# 또는 .env 파일 생성
-echo "GOOGLE_API_KEY=your_api_key_here" > .env
-```
+python main.py --video src/lecture.mp4
 
-Google API 키는 [Google AI Studio](https://aistudio.google.com/app/apikey)에서 발급받을 수 있습니다.
+주요 옵션
 
----
+    --threshold: MSE 감지 임계값 (기본 1000).
 
-## 실행
+    --skip-stage0: 이미 추출된 슬라이드 이미지가 있는 경우 건너뛰기.
 
-### 전체 파이프라인 실행
+    --only <n>: 특정 스테이지만 실행 (예: 지식그래프만 다시 생성 시 --only 3).
 
-```bash
-python main.py --video lecture.mp4 --audio audio.json
-```
+5. 결과물 파일 안내 (output/)
+파일명 (예시)	유형	설명
+*_notes_v2.md	문서	교정된 전사를 바탕으로 생성된 강의 정리 노트
+*_emphasis_std_topic_v2.json	분석	오디오 통계 및 키워드 기반 강조 데이터
+integrated_text.json	데이터	슬라이드+음성 통합 텍스트 및 벡터 데이터 (t3)
+knowledge_graph.html	시각화	인터랙티브 지식그래프 (브라우저 확인용)
+slide_NNN_Xs.jpg	이미지	영상에서 추출된 개별 슬라이드 컷
+6. 요구 사항 (requirements.txt)
 
-### 주요 옵션
+    opencv-python, numpy, Pillow
 
-```bash
-python main.py \
-  --video lecture.mp4 \       # 입력 영상
-  --audio audio.json \        # 오디오 전사 JSON
-  --output ./output \         # 결과 저장 폴더 (기본값: ./output)
-  --threshold 500             # MSE 감지 임계값 (기본값: 500, 범위: 500~2000)
-```
+    google-generativeai, google-genai
 
-### 슬라이드 이미지가 이미 있는 경우 (Stage 0 건너뜀)
+    torch, transformers
 
-```bash
-python main.py --audio audio.json --skip-stage0
-```
-
-### 특정 스테이지만 실행
-
-```bash
-python main.py --only 1    # Stage 1만 실행
-python main.py --only 3    # Stage 3만 실행
-```
-
-### Q&A 시스템 실행
-
-```bash
-python graph_qa.py -g ./output/knowledge_graph.json
-```
-
-Q&A 시스템 내 명령어:
-- 자연어 질문 입력: 그래프 기반 답변
-- `/explain <개념>`: 특정 개념 설명
-- `/rel <개념>`: 개념의 관계 시각화
-- `/q`: 종료
-
----
-
-## MSE 임계값 가이드
-
-| 값 | 적합한 상황 |
-|----|-----------|
-| 500 | 색상 변화가 적은 심플한 PPT, 세밀한 감지 필요 시 |
-| 1000 | 일반 강의 (기본값) |
-| 2000 | 애니메이션·영상 전환이 많은 복잡한 슬라이드 |
-
----
-
-## requirements.txt
-
-```
-opencv-python>=4.8.0
-numpy>=1.24.0
-Pillow>=10.0.0
-google-generativeai>=0.8.0
-google-genai>=0.8.0
-torch>=2.0.0
-transformers>=4.40.0
-pyvis>=0.3.2
-python-dotenv>=1.0.0
-```
-
----
-
-## 지식그래프 관계 타입
-
-Stage 3에서 추출되는 12가지 개념 간 관계:
-
-| 관계 | 의미 |
-|------|------|
-| `is_a` | A는 B의 한 종류 |
-| `part_of` | A는 B의 구성요소 |
-| `implements` | A는 B를 구현 |
-| `abstracts` | A는 B들을 추상화 |
-| `prerequisite_of` | A를 알아야 B 이해 가능 |
-| `uses` | A는 B를 사용 |
-| `calls` | A가 B를 호출 |
-| `compared_to` | A와 B 비교 |
-| `extends` | A가 B를 확장 |
-| `replaces` | A가 B를 대체 |
-| `solves` | A가 B(문제)를 해결 |
-| `optimizes` | A가 B를 최적화 |
+    pyvis, python-dotenv
