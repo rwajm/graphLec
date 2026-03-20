@@ -3,7 +3,7 @@ slide_extractor.py
 ==================
 PPT 기반 강의 영상에서 슬라이드 + 필기 완료 시점 프레임을 추출합니다.
 
-Input : lecture.mp4
+Input : input/lecture.mp4
 Output: output_slides/
         ├── slide_001_base.jpg      # 슬라이드 최초 등장 프레임
         ├── slide_001_annot_01.jpg  # 필기 안정화 캡처
@@ -17,9 +17,9 @@ Output: output_slides/
   4. PPT 애니메이션 (슬라이드 내 대규모 콘텐츠 변화 → 새 base로 분리)
 
 Usage:
-    python slide_extractor.py --input lecture.mp4 --output output_slides/
-    python slide_extractor.py --input lecture.mp4 --output output_slides/ --debug
-    python slide_extractor.py --input lecture.mp4 --tune
+    python slide_extractor.py --input input/lecture.mp4 --output output_slides/
+    python slide_extractor.py --input input/lecture.mp4 --output output_slides/ --debug
+    python slide_extractor.py --input input/lecture.mp4 --tune
 """
 
 import cv2
@@ -625,7 +625,7 @@ def tune_thresholds(input_path: str, sample_sec: float = 30.0):
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PPT 강의 영상 슬라이드 추출기")
-    parser.add_argument("--input",  "-i", default="lecture.mp4",    help="입력 영상 경로")
+    parser.add_argument("--input",  "-i", default="input/lecture.mp4",    help="입력 영상 경로")
     parser.add_argument("--output", "-o", default="output_slides/", help="출력 디렉토리")
     parser.add_argument("--debug",  action="store_true",             help="디버그 로그 출력")
     parser.add_argument("--tune",   action="store_true",             help="임계값 튜닝 모드")

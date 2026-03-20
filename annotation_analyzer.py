@@ -26,14 +26,7 @@ import logging
 import argparse
 import numpy as np
 from pathlib import Path
-from google import genai
 from google.genai import types
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # python-dotenv 없으면 환경변수 직접 설정 필요
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -306,7 +299,6 @@ target_keywords 같은 임의 필드를 추가하지 말 것. 위 JSON 스키마
 
 
 def analyze_annotation_pair(
-    client: genai.Client,
     base_path: str,
     annot_path: str,
     diff_mask: np.ndarray,
@@ -322,6 +314,7 @@ def analyze_annotation_pair(
     region_bboxes: build_diff_mask()가 반환한 정규화 bbox 리스트.
                    Gemini가 annotation_bbox 할당에 사용.
     """
+    from config import gemini_client as client
     log.info(f"  분석 중: slide_{slide_index:03d}_annot_{annot_index:02d} "
              f"(필기 영역 {len(region_bboxes)}개)")
 
@@ -410,17 +403,12 @@ def analyze_annotation_pair(
 # 메인 파이프라인
 # ──────────────────────────────────────────────
 def analyze_all(slides_dir: str, output_path: str, save_masks: bool = False):
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise EnvironmentError("GOOGLE_API_KEY 환경변수가 설정되지 않았습니다.")
+    from config import gemini_client
 
-    # output 디렉토리 자동 생성
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    client = genai.Client(api_key=api_key)
-    cfg    = Config()
-
-    pairs  = load_slide_pairs(slides_dir)
+    cfg   = Config()
+    pairs = load_slide_pairs(slides_dir)
     results = []
 
     mask_dir = Path(slides_dir) / "diff_masks" if save_masks else None
@@ -437,28 +425,22 @@ def analyze_all(slides_dir: str, output_path: str, save_masks: bool = False):
 
         log.info(f"[슬라이드 {slide_idx}] {len(pair['annot_paths'])}개 annot 분석 시작")
 
-        # annot이 여러 개면 직전 annot을 base로 사용 (누적 필기 처리)
         current_base = base_path
         annot_timestamps = pair.get("annot_timestamps", [0.0] * len(pair["annot_paths"]))
         for annot_idx, (annot_path, ts) in enumerate(zip(pair["annot_paths"], annot_timestamps), start=1):
-            # diff 마스크 + 필기 영역 bbox 생성
             diff_mask, region_bboxes = build_diff_mask(current_base, annot_path, cfg)
 
             if save_masks:
                 mask_fname = f"slide_{slide_idx:03d}_annot_{annot_idx:02d}_mask.jpg"
                 cv2.imwrite(str(mask_dir / mask_fname), diff_mask)
 
-            # Gemini 분석
             result = analyze_annotation_pair(
-                client, current_base, annot_path, diff_mask, region_bboxes,
+                current_base, annot_path, diff_mask, region_bboxes,
                 slide_idx, annot_idx, timestamp_sec=ts
             )
             results.append(result)
-
-            # 다음 세션의 base = 현재 annot (누적 필기 지원)
             current_base = annot_path
 
-    # 결과 저장
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
@@ -471,10 +453,14 @@ def analyze_all(slides_dir: str, output_path: str, save_masks: bool = False):
 # CLI
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
+    from config import DEFAULT_SLIDES_DIR, DEFAULT_OUTPUT_DIR
     parser = argparse.ArgumentParser(description="슬라이드 필기 VLM 분석기")
-    parser.add_argument("--slides",  "-s", required=True,                      help="slide_extractor.py 출력 디렉토리")
-    parser.add_argument("--output",  "-o", default="./output/annotation_analysis.json", help="분석 결과 JSON 경로")
-    parser.add_argument("--masks",         action="store_true",                help="diff 마스크 이미지 저장 (디버그용)")
+    parser.add_argument("--slides", "-s", default=str(DEFAULT_SLIDES_DIR),
+                        help=f"slide_extractor.py 출력 디렉토리 (default: {DEFAULT_SLIDES_DIR})")
+    parser.add_argument("--output", "-o",
+                        default=str(DEFAULT_OUTPUT_DIR / "annotation_analysis.json"),
+                        help="분석 결과 JSON 경로")
+    parser.add_argument("--masks", action="store_true", help="diff 마스크 이미지 저장 (디버그용)")
     args = parser.parse_args()
 
     analyze_all(args.slides, args.output, save_masks=args.masks)

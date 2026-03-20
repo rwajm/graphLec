@@ -478,30 +478,52 @@ class ClassificationPipeline:
 
 
 # ============================================================================ #
+#  공개 API (main.py에서 호출)                                                  #
+# ============================================================================ #
+
+def classify_slides(
+    textualized_path: str,
+    metadata_path: str,
+    silences_path: str,
+    output_path: str,
+) -> list:
+    """ClassificationPipeline 래퍼 — main.py에서 단일 함수로 호출."""
+    result = ClassificationPipeline(
+        textualized_path=Path(textualized_path),
+        metadata_path=Path(metadata_path),
+        silence_path=Path(silences_path),
+        output_path=Path(output_path),
+    ).run()
+    return result.get("slides", [])
+
+
+# ============================================================================ #
 #  메인                                                                         #
 # ============================================================================ #
 
 def main():
+    from config import DEFAULT_SLIDES_DIR, DEFAULT_OUTPUT_DIR
+
     parser = argparse.ArgumentParser(description="슬라이드 역할 분류기")
     parser.add_argument(
         "--textualized", "-t",
-        default="./output/slide_textualized.json",
-        help="slide_textualizer.py 출력 경로 (default: ./output/slide_textualized.json)"
+        default=str(DEFAULT_OUTPUT_DIR / "slide_textualized.json"),
+        help=f"slide_textualizer.py 출력 경로 (default: {DEFAULT_OUTPUT_DIR}/slide_textualized.json)"
     )
     parser.add_argument(
         "--metadata", "-m",
-        default="./output_slides/metadata.json",
-        help="slide_extractor.py 메타데이터 경로 (default: ./output_slides/metadata.json)"
+        default=str(DEFAULT_SLIDES_DIR / "metadata.json"),
+        help=f"slide_extractor.py 메타데이터 경로 (default: {DEFAULT_SLIDES_DIR}/metadata.json)"
     )
     parser.add_argument(
         "--silence", "-s",
-        default="./output/silence.json",
-        help="침묵 구간 JSON 경로 (default: ./output/silence.json)"
+        required=True,
+        help="침묵 구간 JSON 경로 (예: output/lecture_silences.json)"
     )
     parser.add_argument(
         "--output", "-o",
-        default="./output/slide_classified.json",
-        help="출력 경로 (default: ./output/slide_classified.json)"
+        default=str(DEFAULT_OUTPUT_DIR / "slide_classified.json"),
+        help=f"출력 경로 (default: {DEFAULT_OUTPUT_DIR}/slide_classified.json)"
     )
 
     args = parser.parse_args()
@@ -509,7 +531,7 @@ def main():
     for path, label in [
         (args.textualized, "slide_textualized.json"),
         (args.metadata,    "metadata.json"),
-        (args.silence,     "silence.json"),
+        (args.silence,     "silences.json"),
     ]:
         if not Path(path).exists():
             print(f"❌ {label} not found: {path}")

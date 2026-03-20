@@ -37,7 +37,6 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from PIL import Image
 
-from google import genai
 from google.genai import types
 
 try:
@@ -59,9 +58,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Config:
-    google_api_key: str = os.getenv('GOOGLE_API_KEY', '')
-    slides_dir: Path = Path("./output_slides")   # slide_extractor.py 출력 디렉토리
-    output_dir: Path = Path("./output")
+    slides_dir: Path = Path("output_slides")     # slide_extractor.py 출력 디렉토리
+    output_dir: Path = Path("output")
+    output_filename: str = "slide_textualized.json"  # 저장 파일명 ({stem}_slide_textualized.json)
     gemini_model: str = "models/gemini-2.5-flash"
     max_retries: int = 3
     retry_delay: float = 5.0
@@ -345,7 +344,8 @@ class T1Extractor:
 
     def __init__(self, config: Config):
         self.config = config
-        self.client = genai.Client(api_key=config.google_api_key)
+        from config import gemini_client
+        self.client = gemini_client
         logger.info("✓ Gemini initialized for t1 extraction")
 
     @staticmethod
@@ -601,7 +601,7 @@ class TextualizationPipeline:
             ]
         }
 
-        output_path = self.config.output_dir / "slide_textualized.json"
+        output_path = self.config.output_dir / self.config.output_filename
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         logger.info(f"✓ Saved: {output_path}")
@@ -632,12 +632,13 @@ class TextualizationPipeline:
 
 def main():
     import argparse
+    from config import DEFAULT_SLIDES_DIR, DEFAULT_OUTPUT_DIR
 
     parser = argparse.ArgumentParser(description="슬라이드 시각 정보 텍스트화")
-    parser.add_argument("-s", "--slides", default="./output_slides",
-                        help="slide_extractor.py 출력 디렉토리 (default: ./output_slides)")
-    parser.add_argument("-o", "--output", default="./output",
-                        help="결과 저장 디렉토리 (default: ./output)")
+    parser.add_argument("-s", "--slides", default=str(DEFAULT_SLIDES_DIR),
+                        help=f"slide_extractor.py 출력 디렉토리 (default: {DEFAULT_SLIDES_DIR})")
+    parser.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT_DIR),
+                        help=f"결과 저장 디렉토리 (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--retries", type=int, default=3,
                         help="Gemini API 재시도 횟수 (default: 3)")
 

@@ -1,82 +1,103 @@
+"""
+config.py
+=========
+API 클라이언트 초기화 및 경로 상수 정의
+
+경로 구조:
+    input/
+        lecture.mp4
+    output_slides/
+        metadata.json
+        slide_0001.jpg
+        ...
+    output/
+        {stem}_slide_textualized.json
+        {stem}_annotation.json
+        {stem}_segments.json
+        {stem}_silences.json
+        {stem}_deictics.json
+        {stem}_deictics_ambiguous.json
+        {stem}_audio_features.json
+        {stem}_audio_quality.json
+        {stem}_emphasis.json
+        {stem}_by_slide.json
+        {stem}_by_slide_iterative.json
+        {stem}_slide_classified.json
+        {stem}_fused.json
+"""
+
 import os
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 from groq import Groq
 from google import genai
 
-# .env 파일 로드
 load_dotenv()
 
-@dataclass
-class PipelineConfig:
-    """전체 파이프라인 통합 설정 및 API 클라이언트 관리"""
+# ──────────────────────────────────────────────────────────────
+# API 키
+# ──────────────────────────────────────────────────────────────
 
-    # ─── API 키 설정 ──────────────────────────────────────────────────────────
-    google_api_key: str = field(
-        default_factory=lambda: os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY", "")
-    )
-    groq_api_key: str = field(
-        default_factory=lambda: os.getenv("GROQ_API_KEY", "")
-    )
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 
-    # ─── 경로 설정 ─────────────────────────────────────────────────────────────
-    video_path: str = ""                    # 입력 영상 파일 
-    audio_json: str = "./audio.json"        # Whisper 전사 결과 JSON 
-    slides_dir: str = "./slides"            # 슬라이드 이미지 저장/읽기 폴더 
-    output_dir: str = "./output"            # 결과물 저장 폴더 
+missing_keys: list[str] = []
+if not GEMINI_API_KEY:
+    missing_keys.append("GOOGLE_API_KEY / GEMINI_API_KEY")
+if not GROQ_API_KEY:
+    missing_keys.append("GROQ_API_KEY")
 
-    # ─── Stage 0 & 1: 영상 처리 및 텍스트 추출 ────────────────────────────────
-    mse_threshold: int = 1000               # 슬라이드 변화 감지 임계값 (500~2000) 
-    mse_sample_rate: float = 0.5            # 프레임 샘플링 간격 (초) 
-    gemini_model: str = "models/gemini-2.0-flash"  # 텍스트 및 개념 추출 모델 
+if missing_keys:
+    print("❌ 필요한 API 키를 환경 변수로 설정해주세요:")
+    for k in missing_keys:
+        print(f"   - {k}")
+    sys.exit(1)
 
-    # ─── Stage 2 & 3: 통합 및 지식그래프 ──────────────────────────────────────
-    embedding_model: str = "models/text-embedding-004"
-    embedding_dim: int = 768
-    match_threshold: float = 0.55           # 오디오-슬라이드 매칭 최소 점수 
-    alpha: float = 0.4                      # 타임스탬프 가중치 
-    synonyms_path: Optional[str] = None     # 동의어 사전 경로 
+# ──────────────────────────────────────────────────────────────
+# API 클라이언트
+# ──────────────────────────────────────────────────────────────
 
-    def __post_init__(self):
-        """초기화 및 디렉토리 생성"""
-        self._validate_keys()
-        Path(self.output_dir).mkdir(parents=True, exist_ok=True) [cite: 1]
-        Path(self.slides_dir).mkdir(parents=True, exist_ok=True) [cite: 1]
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+groq_client   = Groq(api_key=GROQ_API_KEY)
 
-    def _validate_keys(self):
-        """API 키 존재 여부 확인"""
-        missing_keys = []
-        if not self.google_api_key:
-            missing_keys.append("GOOGLE_API_KEY/GEMINI_API_KEY") [cite: 2]
-        if not self.groq_api_key:
-            missing_keys.append("GROQ_API_KEY") [cite: 2]
+# ──────────────────────────────────────────────────────────────
+# 기본 경로 상수 (CLI 인자로 override 가능)
+# ──────────────────────────────────────────────────────────────
 
-        if missing_keys:
-            print("❌ 필요한 API 키가 설정되지 않았습니다:")
-            for k in missing_keys:
-                print(f"   - {k}")
-            sys.exit(1) [cite: 2]
+DEFAULT_INPUT_DIR  = Path("input")
+DEFAULT_SLIDES_DIR = Path("output_slides")   # metadata.json + 슬라이드 이미지
+DEFAULT_OUTPUT_DIR = Path("output")          # 모든 분석 결과
 
-    def get_gemini_client(self):
-        """Gemini API 클라이언트 반환"""
-        return genai.Client(api_key=self.google_api_key) [cite: 2]
+# ──────────────────────────────────────────────────────────────
+# 파일명 헬퍼
+# ──────────────────────────────────────────────────────────────
 
-    def get_groq_client(self):
-        """Groq API 클라이언트 반환"""
-        return Groq(api_key=self.groq_api_key) [cite: 2]
+def output_paths(stem: str, output_dir: Path, slides_dir: Path) -> dict[str, Path]:
+    """
+    영상 stem과 디렉토리로 모든 출력 경로를 한 번에 반환.
 
-    def validate_paths(self) -> bool:
-        """입력 파일 유효성 검사"""
-        if self.video_path and not Path(self.video_path).exists():
-            print(f"❌ 영상 파일 없음: {self.video_path}") [cite: 1]
-            return False
-        return True
-
-# 기본 설정 인스턴스 생성
-config = PipelineConfig()
-gemini_client = config.get_gemini_client()
-groq_client = config.get_groq_client()
+    사용 예:
+        paths = output_paths("lecture", Path("output"), Path("output_slides"))
+        paths["segments"]   # output/lecture_segments.json
+        paths["metadata"]   # output_slides/metadata.json
+    """
+    return {
+        # slides_dir
+        "metadata":            slides_dir / "metadata.json",
+        # output_dir
+        "textualized":         output_dir / f"{stem}_slide_textualized.json",
+        "annotation":          output_dir / f"{stem}_annotation.json",
+        "segments":            output_dir / f"{stem}_segments.json",
+        "silences":            output_dir / f"{stem}_silences.json",
+        "deictics":            output_dir / f"{stem}_deictics.json",
+        "deictics_ambiguous":  output_dir / f"{stem}_deictics_ambiguous.json",
+        "audio_features":      output_dir / f"{stem}_audio_features.json",
+        "audio_quality":       output_dir / f"{stem}_audio_quality.json",
+        "emphasis":            output_dir / f"{stem}_emphasis.json",
+        "by_slide":            output_dir / f"{stem}_by_slide.json",
+        "by_slide_iterative":  output_dir / f"{stem}_by_slide_iterative.json",
+        "classified":          output_dir / f"{stem}_slide_classified.json",
+        "fused":               output_dir / f"{stem}_fused.json",
+    }
