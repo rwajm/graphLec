@@ -7,6 +7,28 @@ from pathlib import Path
 
 from config import groq_client
 
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _normalize_words(words, chunk_start: float = 0.0):
+    out = []
+    if not isinstance(words, list):
+        return out
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        text = str(w.get("word") or w.get("text") or "").strip()
+        if not text:
+            continue
+        start = _safe_float(w.get("start"), 0.0) + chunk_start
+        end = _safe_float(w.get("end"), start) + chunk_start
+        out.append({"text": text, "start": start, "end": end})
+    return out
+
 
 def transcribe_video(video_path: str, duration: float, output_dir=None) -> list[dict]:
     """영상에서 음성 추출 후 Groq Whisper로 전사"""
@@ -47,10 +69,12 @@ def transcribe_video(video_path: str, duration: float, output_dir=None) -> list[
 
         # 타임스탬프 보정 후 추가
         for seg in transcription.segments:
+            words = _normalize_words(seg.get("words"), chunk_start=chunk_start)
             segments.append({
                 "start": seg["start"] + chunk_start,
                 "end": seg["end"] + chunk_start,
-                "text": seg["text"].strip()
+                "text": seg["text"].strip(),
+                "words": words,
             })
 
         # 임시 파일 삭제
