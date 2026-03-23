@@ -31,6 +31,13 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+# 외부 라이브러리 노이즈 로그 억제
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("google").setLevel(logging.WARNING)
+logging.getLogger("google.ai.generativelanguage").setLevel(logging.WARNING)
+logging.getLogger("google.genai").setLevel(logging.WARNING)
+
 GEMINI_MODEL = "gemini-2.5-flash"
 
 

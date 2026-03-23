@@ -1,26 +1,31 @@
-# GPU 사용 시 torch는 아래 링크에서 CUDA 버전에 맞게 먼저 설치: [cite: 1]
+# GPU 사용 시 torch는 아래 링크에서 CUDA 버전에 맞게 먼저 설치: 
 #   pip install torch --index-url https://download.pytorch.org/whl/cu118
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 
+# ── 시스템 의존성 (pip 아닌 apt로 설치) ──────────────────────
+#   sudo apt install ffmpeg
+#   (ffmpeg + ffprobe 모두 포함)
+
 # ── Core & Utilities ──────────────────────────────────────────
-opencv-python>=4.8.0 [cite: 1]
-numpy>=1.24.0 [cite: 1, 2]
-Pillow>=10.0.0 [cite: 1]
-python-dotenv>=1.0.0 [cite: 1, 2]
-librosa [cite: 2]
-pymupdf [cite: 2]
-python-pptx [cite: 2]
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+python-dotenv>=1.0.0
+librosa
+pymupdf
+python-pptx
+ImageHash>=4.3.1
+json-repair
 
 # ── AI & API Clients ──────────────────────────────────────────
-google-generativeai>=0.8.0 [cite: 1]
-google-genai>=0.8.0 [cite: 1, 2]
-groq [cite: 2]
+google-generativeai>=0.8.0
+google-genai>=0.8.0
+groq
 
-# ── ML & Vision (ColPali) ─────────────────────────────────────
-torch>=2.0.0 [cite: 1]
-colpali-engine>=0.3.0 [cite: 1]
-transformers>=4.40.0 [cite: 1]
+# ── ML & Vision ───────────────────────────────────────────────
+torch>=2.0.0
+transformers>=4.40.0
 
 # ── Text & Knowledge Graph ────────────────────────────────────
-kiwipiepy [cite: 2]
-pyvis>=0.3.2 [cite: 1]
+kiwipiepy
+pyvis>=0.3.2

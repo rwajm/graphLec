@@ -232,7 +232,7 @@ def _filter_topic_keywords_by_llm(segments: list[dict], candidate_keywords: set[
         return candidate_keywords
     try:
         from google.genai import types
-        from config import gemini_client
+        from config import gemini_client_2
         from utils import api_call_with_retry
     except ImportError:
         return candidate_keywords
@@ -266,7 +266,7 @@ def _filter_topic_keywords_by_llm(segments: list[dict], candidate_keywords: set[
 선택한 키워드만 배열에 넣으면 됩니다. 반드시 위 후보 목록에 있던 단어만 포함하세요."""
 
     def call_api():
-        return gemini_client.models.generate_content(
+        return gemini_client_2.models.generate_content(
             model="gemini-3-flash-preview",
             contents=[types.Part.from_text(text=prompt)],
             config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=2048),

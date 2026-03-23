@@ -40,12 +40,16 @@ load_dotenv()
 # API 키
 # ──────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+# 비디오 파이프라인용 (slide_textualizer, annotation_analyzer)
+GEMINI_API_KEY_1 = os.getenv("GOOGLE_API_KEY_1") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+# 오디오 파이프라인용 (text_processor, segment_grouper, emphasis_keyword)
+GEMINI_API_KEY_2 = os.getenv("GOOGLE_API_KEY_2") or GEMINI_API_KEY_1  # 키 1개만 있을 때 fallback
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 missing_keys: list[str] = []
-if not GEMINI_API_KEY:
-    missing_keys.append("GOOGLE_API_KEY / GEMINI_API_KEY")
+if not GEMINI_API_KEY_1:
+    missing_keys.append("GOOGLE_API_KEY_1 (또는 GOOGLE_API_KEY)")
 if not GROQ_API_KEY:
     missing_keys.append("GROQ_API_KEY")
 
@@ -59,8 +63,9 @@ if missing_keys:
 # API 클라이언트
 # ──────────────────────────────────────────────────────────────
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-groq_client   = Groq(api_key=GROQ_API_KEY)
+gemini_client   = genai.Client(api_key=GEMINI_API_KEY_1)  # 비디오 파이프라인용
+gemini_client_2 = genai.Client(api_key=GEMINI_API_KEY_2)  # 오디오 파이프라인용
+groq_client     = Groq(api_key=GROQ_API_KEY)
 
 # ──────────────────────────────────────────────────────────────
 # 기본 경로 상수 (CLI 인자로 override 가능)

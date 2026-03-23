@@ -21,7 +21,13 @@ Usage:
     python main.py --input lecture.mp4 --output output/ --slides output/slides/
     python main.py --input lecture.mp4 --skip-extract
     python main.py --input lecture.mp4 --debug --masks
+    python main.py --input lecture.mp4 --force
 """
+
+try:
+    import lzma
+except ImportError:
+    from backports import lzma  # lzma가 없으면 backports.lzma를 사용
 
 import json
 import sys
@@ -43,6 +49,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# 외부 라이브러리 노이즈 로그 억제
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("google").setLevel(logging.WARNING)
+logging.getLogger("google.ai.generativelanguage").setLevel(logging.WARNING)
+logging.getLogger("google.genai").setLevel(logging.WARNING)
 
 # ──────────────────────────────────────────────────────────────
 # 출력 헬퍼
@@ -62,6 +74,16 @@ def _done(label: str, elapsed: float):
 def _save_json(path: Path, data: Any):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _is_done(path: Path, label: str, force: bool) -> bool:
+    """출력 파일이 이미 존재하면 True 반환 (force=True면 항상 False)."""
+    if not force and path.exists() and path.stat().st_size > 0:
+        print(f"\n  ⏭  {label} — 출력 파일 존재, 스킵")
+        print(f"     {path}")
+        print("─" * 70)
+        return True
+    return False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -426,6 +448,12 @@ def _transcribe_by_slide(
 def stage1_extract(args, slides_dir: Path, output_dir: Path) -> dict:
     from slide_extractor import extract_slides
 
+    stem = Path(args.input).stem
+    meta_path = output_dir / f"{stem}_metadata.json"
+
+    if _is_done(meta_path, "Stage 1A 슬라이드 추출", args.force):
+        return {"meta_path": str(meta_path), "elapsed": 0.0}
+
     _banner("Stage 1  —  슬라이드 추출  (slide_extractor)")
     t0 = time.time()
     metadata = extract_slides(
@@ -435,8 +463,6 @@ def stage1_extract(args, slides_dir: Path, output_dir: Path) -> dict:
     )
     elapsed = time.time() - t0
 
-    stem = Path(args.input).stem
-    meta_path = output_dir / f"{stem}_metadata.json"
     _save_json(meta_path, metadata)
 
     slide_count = len({m["slide_index"] for m in metadata})
@@ -450,6 +476,21 @@ def stage1b_audio_analyze(args, output_dir: Path) -> dict:
     from utils import get_video_duration
 
     stem = Path(args.input).stem
+    audio_quality_path = output_dir / f"{stem}_audio_quality.json"
+
+    if _is_done(audio_quality_path, "Stage 1B 오디오 품질 분석", args.force):
+        # duration은 파일에서 복원
+        duration = 0.0
+        try:
+            with open(audio_quality_path) as f:
+                q = json.load(f)
+            duration = _safe_float(q.get("duration_sec"), 0.0)
+        except Exception:
+            pass
+        if duration == 0.0:
+            duration = get_video_duration(args.input)
+        return {"duration": duration, "elapsed": 0.0}
+
     video_path = args.input
 
     _banner("Stage 1B  —  오디오 품질 분석  (audio_analyzer)")
@@ -461,7 +502,7 @@ def stage1b_audio_analyze(args, output_dir: Path) -> dict:
         audio_features = analyze_audio_features(audio_path)
         audio_quality = evaluate_audio_quality(audio_features)
         _save_json(output_dir / f"{stem}_audio_features.json", audio_features)
-        _save_json(output_dir / f"{stem}_audio_quality.json", audio_quality)
+        _save_json(audio_quality_path, audio_quality)
         print(f"  ✓ 품질: {audio_quality['overall_score']}/100 ({audio_quality['overall_grade']})")
     finally:
         Path(audio_path).unlink(missing_ok=True)
@@ -475,6 +516,9 @@ def stage2_textualize(args, slides_dir: Path, output_dir: Path) -> dict:
 
     stem = Path(args.input).stem
     textualized_path = output_dir / f"{stem}_slide_textualized.json"
+
+    if _is_done(textualized_path, "Stage 2 슬라이드 텍스트화", args.force):
+        return {"textualized_path": str(textualized_path), "elapsed": 0.0}
 
     _banner("Stage 2  —  슬라이드 텍스트화  (slide_textualizer)")
     t0 = time.time()
@@ -497,6 +541,9 @@ def stage3a_annotation(args, slides_dir: Path, output_dir: Path) -> dict:
     stem = Path(args.input).stem
     annotation_path = output_dir / f"{stem}_annotation.json"
 
+    if _is_done(annotation_path, "Stage 3A annotation", args.force):
+        return {"annotation_path": str(annotation_path), "elapsed": 0.0}
+
     _banner("Stage 3A  —  필기 강조 분석  (annotation_analyzer)")
     t0 = time.time()
     annot_results = analyze_all(
@@ -518,6 +565,7 @@ def stage3b_audio(args, meta_path: str, textualized_path: str, duration: float, 
         group_segments_by_slide_and_context,
         expand_group_annotations_to_segments,
     )
+    from audio_analyzer import extract_audio_from_video
     from emphasis_audio import detect_emphasis_by_std
     from emphasis_keyword import (
         detect_emphasis_by_keywords_weighted,
@@ -527,6 +575,41 @@ def stage3b_audio(args, meta_path: str, textualized_path: str, duration: float, 
     from emphasis_combiner import combine_emphasis_simple
 
     stem = Path(args.input).stem
+    segments_path = output_dir / f"{stem}_segments.json"
+    silences_path = output_dir / f"{stem}_silences.json"
+    emphasis_path = output_dir / f"{stem}_emphasis.json"
+
+    if _is_done(segments_path, "Stage 3B 오디오 파이프라인", args.force):
+        # in-memory 데이터를 저장된 파일에서 복원
+        by_slide_path = output_dir / f"{stem}_by_slide.json"
+        slides_structure = None
+        if by_slide_path.exists():
+            try:
+                with open(by_slide_path) as f:
+                    slides_structure = json.load(f).get("slides")
+            except Exception:
+                pass
+
+        annotated_segments: list[dict] = []
+        try:
+            with open(segments_path) as f:
+                annotated_segments = json.load(f).get("segments", [])
+        except Exception:
+            pass
+
+        slide_ranges = load_slide_ranges(meta_path, duration) if meta_path and Path(meta_path).is_file() else []
+
+        return {
+            "segments_path": str(segments_path),
+            "silences_path": str(silences_path),
+            "deictics_path": str(output_dir / f"{stem}_deictics.json"),
+            "emphasis_path": str(emphasis_path),
+            "annotated_segments": annotated_segments,
+            "slides_structure": slides_structure,
+            "slide_ranges": slide_ranges,
+            "duration": duration,
+        }
+
     video_path = args.input
 
     _banner("Stage 3B  —  오디오 파이프라인")
@@ -552,7 +635,7 @@ def stage3b_audio(args, meta_path: str, textualized_path: str, duration: float, 
     t0 = time.time()
     segments = correct_segments_dual_with_slide_context(segments_raw, slide_context_by_index)
     segments_clean = [{k: v for k, v in s.items() if k != "words"} for s in segments]
-    _save_json(output_dir / f"{stem}_segments.json", {
+    _save_json(segments_path, {
         "video_path": video_path,
         "segment_count": len(segments_clean),
         "segments": segments_clean,
@@ -575,7 +658,6 @@ def stage3b_audio(args, meta_path: str, textualized_path: str, duration: float, 
                 "prev_segment_index": i,
                 "next_segment_index": i + 1,
             })
-    silences_path = output_dir / f"{stem}_silences.json"
     _save_json(silences_path, {
         "video_path": video_path,
         "total_duration_sec": duration,
@@ -635,7 +717,7 @@ def stage3b_audio(args, meta_path: str, textualized_path: str, duration: float, 
         annotated_segments = expand_group_annotations_to_segments(
             annotated_groups, segments_clean, groups
         )
-        _save_json(output_dir / f"{stem}_emphasis.json", {
+        _save_json(emphasis_path, {
             "method": "std_topic",
             "description": "표준편차 + 가중치 키워드 + 주제 키워드 반복",
             "statistics": {
@@ -652,10 +734,10 @@ def stage3b_audio(args, meta_path: str, textualized_path: str, duration: float, 
 
     _done("오디오 파이프라인", 0.0)
     return {
-        "segments_path": str(output_dir / f"{stem}_segments.json"),
+        "segments_path": str(segments_path),
         "silences_path": str(silences_path),
         "deictics_path": str(output_dir / f"{stem}_deictics.json"),
-        "emphasis_path": str(output_dir / f"{stem}_emphasis.json"),
+        "emphasis_path": str(emphasis_path),
         "annotated_segments": annotated_segments,
         "slides_structure": slides_structure,
         "slide_ranges": slide_ranges,
@@ -670,6 +752,9 @@ def stage4a_classify(
 
     stem = Path(args.input).stem
     classified_path = output_dir / f"{stem}_slide_classified.json"
+
+    if _is_done(classified_path, "Stage 4A 슬라이드 분류", args.force):
+        return {"classified_path": str(classified_path), "elapsed": 0.0}
 
     _banner("Stage 4A  —  슬라이드 분류  (slide_classifier)")
     t0 = time.time()
@@ -688,6 +773,8 @@ def stage4b_save_by_slide(args, audio_result: dict, output_dir: Path) -> dict:
     from segment_grouper import group_segments_by_slide_and_context_iterative
 
     stem = Path(args.input).stem
+    by_slide_path = output_dir / f"{stem}_by_slide.json"
+
     slides_structure = audio_result.get("slides_structure")
     annotated_segments = audio_result.get("annotated_segments", [])
     slide_ranges = audio_result.get("slide_ranges", [])
@@ -696,10 +783,17 @@ def stage4b_save_by_slide(args, audio_result: dict, output_dir: Path) -> dict:
     if not slides_structure or not slide_ranges:
         return {}
 
+    if _is_done(by_slide_path, "Stage 4B by_slide 저장", args.force):
+        by_slide_iter_path = output_dir / f"{stem}_by_slide_iterative.json"
+        return {
+            "by_slide_path": str(by_slide_path),
+            "by_slide_iter_path": str(by_slide_iter_path),
+            "elapsed": 0.0,
+        }
+
     _banner("Stage 4B  —  by_slide 구조 저장")
     t0 = time.time()
 
-    by_slide_path = output_dir / f"{stem}_by_slide.json"
     _save_json(by_slide_path, {"slides": slides_structure})
 
     slides_iter = group_segments_by_slide_and_context_iterative(
@@ -728,6 +822,9 @@ def stage5_fusion(
 
     stem = Path(args.input).stem
     fused_path = output_dir / f"{stem}_fused.json"
+
+    if _is_done(fused_path, "Stage 5 퓨전", args.force):
+        return {"fused_path": str(fused_path), "elapsed": 0.0}
 
     _banner("Stage 5  —  퓨전  (fusion)")
     t0 = time.time()
@@ -785,126 +882,134 @@ def run_pipeline(args):
     print(f"  입력 영상 : {args.input}")
     print(f"  슬라이드  : {slides_dir}")
     print(f"  출력      : {output_dir}")
+    if args.force:
+        print("  ⚠️  --force: 모든 단계 강제 재실행")
 
-    # ── Stage 1 (병렬 A/B) ──
-    _banner("Stage 1  —  병렬 실행 (슬라이드 추출 + 오디오 품질 분석)")
-    t_parallel = time.time()
-    audio_analyze_result: dict = {}
+    try:
+        # ── Stage 1 (병렬 A/B) ──
+        _banner("Stage 1  —  병렬 실행 (슬라이드 추출 + 오디오 품질 분석)")
+        t_parallel = time.time()
+        audio_analyze_result: dict = {}
 
-    if args.skip_extract:
-        log.info("Stage 1A 건너뜀 (--skip-extract)")
-        meta_path = str(paths["metadata"])
-        timings["Stage 1A 슬라이드 추출"] = 0.0
-        audio_analyze_result = stage1b_audio_analyze(args, output_dir)
-        timings["Stage 1B 오디오 품질 분석"] = audio_analyze_result["elapsed"]
-    else:
+        if args.skip_extract:
+            log.info("Stage 1A 건너뜀 (--skip-extract)")
+            meta_path = str(paths["metadata"])
+            timings["Stage 1A 슬라이드 추출"] = 0.0
+            audio_analyze_result = stage1b_audio_analyze(args, output_dir)
+            timings["Stage 1B 오디오 품질 분석"] = audio_analyze_result["elapsed"]
+        else:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_1a = executor.submit(stage1_extract, args, slides_dir, output_dir)
+                future_1b = executor.submit(stage1b_audio_analyze, args, output_dir)
+                for future in as_completed([future_1a, future_1b]):
+                    if future is future_1a:
+                        r1 = future.result()
+                        meta_path = r1["meta_path"]
+                        timings["Stage 1A 슬라이드 추출"] = r1["elapsed"]
+                    else:
+                        audio_analyze_result = future.result()
+                        timings["Stage 1B 오디오 품질 분석"] = audio_analyze_result["elapsed"]
+
+        duration = audio_analyze_result.get("duration", 0.0)
+        timings["Stage 1 병렬 총"] = time.time() - t_parallel
+        print(f"\n  ✓ Stage 1 완료  ({timings['Stage 1 병렬 총']:.1f}초)")
+        print("─" * 70)
+
+        # ── Stage 2 (직렬) ──
+        r2 = stage2_textualize(args, slides_dir, output_dir)
+        textualized_path = r2["textualized_path"]
+        timings["Stage 2 슬라이드 텍스트화"] = r2["elapsed"]
+
+        # ── Stage 3 (병렬 A/B) ──
+        _banner("Stage 3  —  병렬 실행 (annotation + 오디오)")
+        t_parallel = time.time()
+        audio_result: dict = {}
+        annotation_result: dict = {}
+
         with ThreadPoolExecutor(max_workers=2) as executor:
-            future_1a = executor.submit(stage1_extract, args, slides_dir, output_dir)
-            future_1b = executor.submit(stage1b_audio_analyze, args, output_dir)
-            for future in as_completed([future_1a, future_1b]):
-                if future is future_1a:
-                    r1 = future.result()
-                    meta_path = r1["meta_path"]
-                    timings["Stage 1A 슬라이드 추출"] = r1["elapsed"]
+            future_a = executor.submit(stage3a_annotation, args, slides_dir, output_dir)
+            future_b = executor.submit(stage3b_audio, args, meta_path, textualized_path, duration, output_dir)
+            for future in as_completed([future_a, future_b]):
+                if future is future_a:
+                    annotation_result = future.result()
+                    timings["Stage 3A annotation"] = annotation_result["elapsed"]
                 else:
-                    audio_analyze_result = future.result()
-                    timings["Stage 1B 오디오 품질 분석"] = audio_analyze_result["elapsed"]
+                    audio_result = future.result()
 
-    duration = audio_analyze_result.get("duration", 0.0)
-    timings["Stage 1 병렬 총"] = time.time() - t_parallel
-    print(f"\n  ✓ Stage 1 완료  ({timings['Stage 1 병렬 총']:.1f}초)")
-    print("─" * 70)
+        timings["Stage 3 병렬 총"] = time.time() - t_parallel
+        print(f"\n  ✓ Stage 3 완료  ({timings['Stage 3 병렬 총']:.1f}초)")
+        print("─" * 70)
 
-    # ── Stage 2 (직렬) ──
-    r2 = stage2_textualize(args, slides_dir, output_dir)
-    textualized_path = r2["textualized_path"]
-    timings["Stage 2 슬라이드 텍스트화"] = r2["elapsed"]
+        # ── Stage 4 (병렬 C/D) ──
+        _banner("Stage 4  —  병렬 실행 (classifier + by_slide 저장)")
+        t_parallel = time.time()
+        classified_result: dict = {}
+        by_slide_result: dict = {}
 
-    # ── Stage 3 (병렬 A/B) ──
-    _banner("Stage 3  —  병렬 실행 (annotation + 오디오)")
-    t_parallel = time.time()
-    audio_result: dict = {}
-    annotation_result: dict = {}
+        silences_path = audio_result.get("silences_path", str(paths["silences"]))
+        annotation_path = annotation_result.get("annotation_path", str(paths["annotation"]))
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_a = executor.submit(stage3a_annotation, args, slides_dir, output_dir)
-        future_b = executor.submit(stage3b_audio, args, meta_path, textualized_path, duration, output_dir)
-        for future in as_completed([future_a, future_b]):
-            if future is future_a:
-                annotation_result = future.result()
-                timings["Stage 3A annotation"] = annotation_result["elapsed"]
-            else:
-                audio_result = future.result()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_c = executor.submit(
+                stage4a_classify, args, textualized_path, meta_path, silences_path, output_dir
+            )
+            future_d = executor.submit(stage4b_save_by_slide, args, audio_result, output_dir)
+            for future in as_completed([future_c, future_d]):
+                if future is future_c:
+                    classified_result = future.result()
+                    timings["Stage 4A 분류"] = classified_result.get("elapsed", 0.0)
+                else:
+                    by_slide_result = future.result()
+                    timings["Stage 4B by_slide 저장"] = by_slide_result.get("elapsed", 0.0)
 
-    timings["Stage 3 병렬 총"] = time.time() - t_parallel
-    print(f"\n  ✓ Stage 3 완료  ({timings['Stage 3 병렬 총']:.1f}초)")
-    print("─" * 70)
+        timings["Stage 4 병렬 총"] = time.time() - t_parallel
+        print(f"\n  ✓ Stage 4 완료  ({timings['Stage 4 병렬 총']:.1f}초)")
+        print("─" * 70)
 
-    # ── Stage 4 (병렬 C/D) ──
-    _banner("Stage 4  —  병렬 실행 (classifier + by_slide 저장)")
-    t_parallel = time.time()
-    classified_result: dict = {}
-    by_slide_result: dict = {}
-
-    silences_path = audio_result.get("silences_path", str(paths["silences"]))
-    annotation_path = annotation_result.get("annotation_path", str(paths["annotation"]))
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_c = executor.submit(
-            stage4a_classify, args, textualized_path, meta_path, silences_path, output_dir
+        # ── Stage 5 (직렬) ──
+        r5 = stage5_fusion(
+            args,
+            textualized_path=textualized_path,
+            annotation_path=annotation_path,
+            audio_result=audio_result,
+            output_dir=output_dir,
         )
-        future_d = executor.submit(stage4b_save_by_slide, args, audio_result, output_dir)
-        for future in as_completed([future_c, future_d]):
-            if future is future_c:
-                classified_result = future.result()
-                timings["Stage 4A 분류"] = classified_result.get("elapsed", 0.0)
-            else:
-                by_slide_result = future.result()
-                timings["Stage 4B by_slide 저장"] = by_slide_result.get("elapsed", 0.0)
+        timings["Stage 5 퓨전"] = r5["elapsed"]
 
-    timings["Stage 4 병렬 총"] = time.time() - t_parallel
-    print(f"\n  ✓ Stage 4 완료  ({timings['Stage 4 병렬 총']:.1f}초)")
-    print("─" * 70)
+        # ── 생성된 파일 목록 ──
+        print("\n  생성된 파일:")
+        output_files = [
+            audio_result.get("segments_path", ""),
+            audio_result.get("silences_path", ""),
+            audio_result.get("deictics_path", ""),
+            audio_result.get("emphasis_path", ""),
+            annotation_path,
+            textualized_path,
+            classified_result.get("classified_path", ""),
+            by_slide_result.get("by_slide_path", ""),
+            r5.get("fused_path", ""),
+        ]
+        for path_str in output_files:
+            if not path_str:
+                continue
+            p = Path(path_str)
+            print(f"    {'✓' if p.exists() else '✗'}  {p}")
+        print()
 
-    # ── Stage 5 (직렬) ──
-    r5 = stage5_fusion(
-        args,
-        textualized_path=textualized_path,
-        annotation_path=annotation_path,
-        audio_result=audio_result,
-        output_dir=output_dir,
-    )
-    timings["Stage 5 퓨전"] = r5["elapsed"]
+    except Exception as e:
+        print(f"\n❌ 파이프라인 오류: {e}")
+        raise
 
-    # ── 최종 요약 ──
-    total_elapsed = time.time() - total_start
-    print("\n" + "═" * 70)
-    print("  ✅ 파이프라인 완료")
-    print("═" * 70)
-    print("\n  단계별 소요 시간:")
-    for stage, t in timings.items():
-        label = "  (건너뜀)" if t == 0.0 else f"  {t:>7.1f}초"
-        print(f"    {stage:<30} {label}")
-    print(f"\n    {'총 소요 시간':<30}  {total_elapsed:>7.1f}초")
-
-    print("\n  생성된 파일:")
-    output_files = [
-        audio_result.get("segments_path", ""),
-        audio_result.get("silences_path", ""),
-        audio_result.get("deictics_path", ""),
-        audio_result.get("emphasis_path", ""),
-        annotation_path,
-        textualized_path,
-        classified_result.get("classified_path", ""),
-        by_slide_result.get("by_slide_path", ""),
-        r5.get("fused_path", ""),
-    ]
-    for path_str in output_files:
-        if not path_str:
-            continue
-        p = Path(path_str)
-        print(f"    {'✓' if p.exists() else '✗'}  {p}")
-    print()
+    finally:
+        # 성공/실패 무관하게 항상 타이밍 출력
+        total_elapsed = time.time() - total_start
+        print("\n" + "═" * 70)
+        print("  단계별 소요 시간 (현재까지)")
+        print("═" * 70)
+        for stage, t in timings.items():
+            label = "  (스킵)" if t == 0.0 else f"  {t:>7.1f}초"
+            print(f"    {stage:<30} {label}")
+        print(f"\n    {'총 소요 시간':<30}  {total_elapsed:>7.1f}초")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -923,19 +1028,22 @@ def main():
   python main.py --input input/lecture.mp4 --output output/ --slides output_slides/
   python main.py --input input/lecture.mp4 --skip-extract
   python main.py --input input/lecture.mp4 --debug --masks
+  python main.py --input input/lecture.mp4 --force
         """,
     )
-    parser.add_argument("--input",  "-i", required=True, help="입력 강의 영상 경로 (.mp4)")
+    parser.add_argument("--input",  "-i", default="input/lecture.mp4", help="입력 강의 영상 경로 (.mp4)")
     parser.add_argument("--slides", "-s", default=str(DEFAULT_SLIDES_DIR),
                         help=f"슬라이드 프레임 저장 디렉토리 (default: {DEFAULT_SLIDES_DIR})")
     parser.add_argument("--output", "-o", default=str(DEFAULT_OUTPUT_DIR),
                         help=f"분석 결과 저장 디렉토리 (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--skip-extract", action="store_true",
-                        help="Stage 1 건너뜀 (이미 슬라이드가 추출된 경우)")
+                        help="Stage 1A 건너뜀 (이미 슬라이드가 추출된 경우)")
+    parser.add_argument("--force", action="store_true",
+                        help="출력 파일이 있어도 모든 단계 강제 재실행")
     parser.add_argument("--retries", type=int, default=3,
                         help="Gemini API 재시도 횟수 (default: 3)")
     parser.add_argument("--debug", action="store_true", help="Stage 1 디버그 로그 출력")
-    parser.add_argument("--masks", action="store_true", help="Stage 2-2 diff 마스크 이미지 저장")
+    parser.add_argument("--masks", action="store_true", help="Stage 3A diff 마스크 이미지 저장")
 
     args = parser.parse_args()
 

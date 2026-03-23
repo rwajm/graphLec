@@ -16,7 +16,7 @@ import re
 
 from google.genai import types
 
-from config import gemini_client
+from config import gemini_client_2
 from utils import api_call_with_retry
 
 
@@ -84,7 +84,7 @@ def decide_semantic_merges(groups: list[dict]) -> set[int]:
 """
 
     def call_api():
-        return gemini_client.models.generate_content(
+        return gemini_client_2.models.generate_content(
             model="gemini-3-flash-preview",
             contents=[types.Part.from_text(text=prompt)],
             config=types.GenerateContentConfig(
@@ -168,7 +168,7 @@ def decide_merge_pair(current_text: str, next_text: str, max_chars: int = 400) -
 추가 설명이나 다른 문장은 쓰지 말고, "MERGE" 또는 "SPLIT" 중 하나만 출력하세요."""
 
     def call_api():
-        return gemini_client.models.generate_content(
+        return gemini_client_2.models.generate_content(
             model="gemini-3-flash-preview",
             contents=[types.Part.from_text(text=prompt)],
             config=types.GenerateContentConfig(

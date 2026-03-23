@@ -6,7 +6,7 @@ import json
 
 from google.genai import types
 
-from config import gemini_client
+from config import gemini_client_2
 from utils import api_call_with_retry
 
 
@@ -36,7 +36,7 @@ def correct_segments(segments: list[dict], batch_size: int = 100) -> list[dict]:
 - 자연스러운 문장으로"""
 
         def call_api():
-            return gemini_client.models.generate_content(
+            return gemini_client_2.models.generate_content(
                 model="gemini-3-flash-preview",
                 contents=[types.Part.from_text(text=prompt)],
                 config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=16384)
@@ -114,7 +114,7 @@ def correct_segments_dual(segments: list[dict], batch_size: int = 100) -> list[d
 """
 
         def call_api_stage1():
-            return gemini_client.models.generate_content(
+            return gemini_client_2.models.generate_content(
                 model="gemini-3-flash-preview",
                 contents=[types.Part.from_text(text=prompt)],
                 config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=16384),
@@ -174,7 +174,7 @@ def correct_segments_dual(segments: list[dict], batch_size: int = 100) -> list[d
 """
 
         def call_api_stage2():
-            return gemini_client.models.generate_content(
+            return gemini_client_2.models.generate_content(
                 model="gemini-3-flash-preview",
                 contents=[types.Part.from_text(text=prompt2)],
                 config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=16384),
@@ -304,7 +304,7 @@ def correct_segments_dual_with_slide_context(
 """
 
         def call_api_stage1():
-            return gemini_client.models.generate_content(
+            return gemini_client_2.models.generate_content(
                 model="gemini-3-flash-preview",
                 contents=[types.Part.from_text(text=prompt)],
                 config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=16384),
@@ -370,7 +370,7 @@ def correct_segments_dual_with_slide_context(
 """
 
         def call_api_stage2():
-            return gemini_client.models.generate_content(
+            return gemini_client_2.models.generate_content(
                 model="gemini-3-flash-preview",
                 contents=[types.Part.from_text(text=prompt2)],
                 config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=16384),
@@ -455,7 +455,7 @@ def generate_lecture_notes(segments: list[dict]) -> str:
 이제 위 지침에 따라 상세하고 체계적인 강의 노트를 작성하세요."""
 
     def call_api():
-        return gemini_client.models.generate_content(
+        return gemini_client_2.models.generate_content(
             model="gemini-3-flash-preview",
             contents=[types.Part.from_text(text=prompt)],
             config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=16384)
