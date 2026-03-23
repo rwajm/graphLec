@@ -4,6 +4,7 @@
 
 # ── 시스템 의존성 (pip 아닌 apt로 설치) ──────────────────────
 #   sudo apt install ffmpeg
+#   sudo apt install openjdk-21-jdk   (Neo4j 실행에 필요)
 #   (ffmpeg + ffprobe 모두 포함)
 
 # ── Core & Utilities ──────────────────────────────────────────
@@ -29,3 +30,11 @@ transformers>=4.40.0
 # ── Text & Knowledge Graph ────────────────────────────────────
 kiwipiepy
 pyvis>=0.3.2
+
+# ── Graph DB ─────────────────────────────────────────────────
+neo4j>=5.0.0
+
+# ── Web API (질의 시스템) ─────────────────────────────────────
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pydantic>=2.0.0
