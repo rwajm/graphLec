@@ -21,7 +21,6 @@ API 클라이언트 초기화 및 경로 상수 정의
         {stem}_audio_quality.json
         {stem}_emphasis.json
         {stem}_by_slide.json
-        {stem}_by_slide_iterative.json
         {stem}_slide_classified.json
         {stem}_fused.json
 """
@@ -102,7 +101,6 @@ def output_paths(stem: str, output_dir: Path, slides_dir: Path) -> dict[str, Pat
         "audio_quality":       output_dir / f"{stem}_audio_quality.json",
         "emphasis":            output_dir / f"{stem}_emphasis.json",
         "by_slide":            output_dir / f"{stem}_by_slide.json",
-        "by_slide_iterative":  output_dir / f"{stem}_by_slide_iterative.json",
         "classified":          output_dir / f"{stem}_slide_classified.json",
         "fused":               output_dir / f"{stem}_fused.json",
     }
