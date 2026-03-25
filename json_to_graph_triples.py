@@ -65,8 +65,34 @@ RELATION_TYPES = {
     "solves", "optimizes"
 }
 
+ENTITY_TYPES = {
+    "concept", "agent", "system", "artifact",
+    "method", "event", "phenomenon", "metric",
+    "location", "time_period"
+}
+
+DOMAIN_PROMPT = """
+아래 강의 내용을 보고 도메인을 분류해라. 설명 없이 JSON만 출력.
+
+[본문]
+{content}
+
+출력 형식:
+{{
+  "domain": "engineering|natural_science|humanities|social_science|arts",
+  "subdomain": "computer_science|physics|economics|..."
+}}
+
+도메인 기준:
+- engineering: 설계·시스템·구현·최적화 중심
+- natural_science: 자연 현상·법칙·실험·측정 중심
+- humanities: 해석·사상·텍스트·역사·철학 중심
+- social_science: 사회 구조·제도·정책·행위자·지표 중심
+- arts: 작품·표현·매체·양식·창작 중심
+"""
+
 EXTRACTION_PROMPT = """
-아래는 강의 전체 내용이다. 슬라이드 텍스트와 오디오 전사가 함께 제공된다.
+아래는 강의 전체 내용이다. 도메인: {domain} / {subdomain}
 설명 없이 JSON만 출력.
 
 각 텍스트 단위에는 [source_id] 태그가 붙어 있다.
@@ -78,37 +104,52 @@ EXTRACTION_PROMPT = """
 
 출력 형식:
 {{
-  "concepts": ["개념1", "개념2", ...],
+  "entities": [
+    {{"name": "엔티티명", "type": "엔티티타입"}},
+    ...
+  ],
   "relations": [
     {{
-      "from": "출발 개념",
-      "to": "도착 개념",
+      "from": "출발 엔티티명",
+      "to": "도착 엔티티명",
       "type": "관계 타입",
       "evidence": "근거 문장"
     }}
   ],
   "mentions": {{
-    "개념1": ["segment/0001", "slide_002"],
-    "개념2": ["segment/0003", "slide_005"]
+    "엔티티명": ["segment/0001", "slide_002"],
+    ...
   }}
 }}
+
+엔티티 타입 (10가지만 사용):
+- concept   : 추상 개념, 이론, 원리, 분류
+- agent     : 행위 주체, 사람, 집단, 조직, 기관
+- system    : 구조적으로 결합된 체계
+- artifact  : 인공물, 문서, 도구, 소프트웨어
+- method    : 절차, 알고리즘, 기법, 실험법
+- event     : 사건, 실행, 변화, 실험, 시행
+- phenomenon: 현상, 문제, 효과, 상태
+- metric    : 변수, 지표, 측정값, 성능값
+- location  : 장소, 영역, 공간, 구간
+- time_period: 시점, 기간, 시대, 단계
+
+엔티티 추출 규칙:
+- 강의 전체에서 등장하는 모든 핵심 엔티티 추출, 동일 엔티티 통합
+- 정의·용어·기술적 메커니즘·문제·현상·구체적 식별자·행위자·도구 모두 포함
+- 슬라이드 레이블(코드 번호, 그림 번호), 교육 메타 표현("다음 슬라이드", "예제") 제외
+- 수량 제한 없음: 강의에 등장하는 모든 의미있는 엔티티 추출
+- 자기 자신과의 관계 제외
 
 관계 타입 (12가지만 사용):
 is_a, part_of, implements, abstracts, prerequisite_of, uses, calls,
 compared_to, extends, replaces, solves, optimizes
 
-개념 추출 규칙:
-- 강의 전체에서 핵심 개념 추출, 동일 개념 통합
-- 정의/용어, 기술적 메커니즘, 문제/현상, 구체적 식별자 포함
-- 슬라이드 레이블(코드 번호, 그림 번호), 교육 메타 표현 제외
-- 전체 개념 수: 최소 15개, 최대 40개
-- 자기 자신과의 관계 제외
-
 mentions 작성 규칙:
-- 각 개념이 직접 언급/설명/예시로 다뤄지는 모든 source_id 나열
+- 각 엔티티가 직접 언급·설명·예시로 다뤄지는 모든 source_id 나열
 - 정확한 단어 일치 불필요, 관련 설명·예시도 포함
 - segment와 slide 양쪽 모두 포함 가능
-- 모든 concept는 최소 1개 이상의 source_id 필수
+- 모든 entity는 최소 1개 이상의 source_id 필수
 """
 
 
@@ -205,29 +246,15 @@ class Preprocessor:
 # ============================================================================
 
 class ConceptNormalizer:
-    SYNONYMS = {
-        "시스템 호출": ["system call", "시스템콜", "syscall"],
-        "운영체제":    ["operating system", "OS", "os"],
-        "프로세스":    ["process"],
-        "커널":       ["kernel"],
-        "메모리":     ["memory", "RAM", "ram"],
-        "클래스":     ["class"],
-        "객체":       ["object"],
-        "메서드":     ["method"],
-        "함수":       ["function"],
-    }
 
     def __init__(self):
-        self.reverse_map: Dict[str, str] = {}
-        for canonical, variants in self.SYNONYMS.items():
-            for v in variants:
-                self.reverse_map[v.lower()] = canonical
+        pass
 
     def normalize(self, concept: str) -> str:
         concept = concept.strip()
         if '(' in concept:
             concept = concept.split('(')[0].strip()
-        return self.reverse_map.get(concept.lower(), concept)
+        return concept
 
     @staticmethod
     def to_slug(name: str) -> str:
@@ -248,6 +275,7 @@ class StructureLayerBuilder:
         self.pre = pre
         self.c   = collector
         self.cfg = config
+        self.vid = f'lecture_video/{config.stem}'
 
     def build(self):
         self._build_root()
@@ -259,16 +287,16 @@ class StructureLayerBuilder:
         logger.info("✓ 구조 레이어 완료")
 
     def _build_root(self):
-        self.c.add('lecture_video', 'type', 'Video', {'title': self.cfg.lecture_title})
-        self.c.add('lecture_video', 'HAS_SLIDES', 'lecture_video/slides')
-        self.c.add('lecture_video/slides', 'type', 'Slides')
-        self.c.add('lecture_video', 'HAS_SCENES', 'lecture_video/scenes')
-        self.c.add('lecture_video/scenes', 'type', 'Scenes')
+        self.c.add(self.vid, 'type', 'Video', {'title': self.cfg.lecture_title, 'stem': self.cfg.stem})
+        self.c.add(self.vid, 'HAS_SLIDES', f'{self.vid}/slides')
+        self.c.add(f'{self.vid}/slides', 'type', 'Slides')
+        self.c.add(self.vid, 'HAS_SCENES', f'{self.vid}/scenes')
+        self.c.add(f'{self.vid}/scenes', 'type', 'Scenes')
 
     def _build_slides(self):
         for slide in self.pre.slides:
             sid = slide['slide_id']
-            self.c.add('lecture_video/slides', 'CONTAINS', sid)
+            self.c.add(f'{self.vid}/slides', 'CONTAINS', sid)
             self.c.add(sid, 'type', 'Slide', {
                 'slide_number':  slide.get('slide_number'),
                 'title':         slide.get('title', ''),
@@ -282,7 +310,7 @@ class StructureLayerBuilder:
     def _build_scenes(self):
         """context 단위 Scene 노드 생성"""
         for scene_id, data in self.pre.scene_data.items():
-            self.c.add('lecture_video/scenes', 'CONTAINS', scene_id)
+            self.c.add(f'{self.vid}/scenes', 'CONTAINS', scene_id)
             self.c.add(data['slide_id'], 'HAS_SCENE', scene_id)
             self.c.add(scene_id, 'type', 'Scene', {
                 'slide_id':      data['slide_id'],
@@ -354,8 +382,7 @@ class ConceptLayerBuilder:
         self.c          = collector
         self.cfg        = config
         self.normalizer = ConceptNormalizer()
-
-        self.client = genai.Client(api_key=config.google_api_key)
+        self.client     = genai.Client(api_key=config.google_api_key)
 
     def build(self):
         content = self._build_full_content()
@@ -363,35 +390,56 @@ class ConceptLayerBuilder:
             logger.warning("전체 콘텐츠가 비어있음")
             return
 
-        logger.info("개념 레이어 추출 중 (전체 슬라이드 한번에)...")
-        result = self._extract(content)
+        # ── 0. 도메인 감지 ───────────────────────────────────────────────────
+        # 토큰 절약: 앞 3000자만 사용
+        domain_result = self._call_gemini(DOMAIN_PROMPT.format(content=content[:3000]))
+        domain    = domain_result.get('domain', 'engineering') if domain_result else 'engineering'
+        subdomain = domain_result.get('subdomain', '')         if domain_result else ''
+        logger.info(f"  도메인: {domain} / {subdomain}")
+
+        # 도메인 노드 저장
+        self.c.add('lecture_video', 'HAS_DOMAIN', f'domain/{domain}')
+        self.c.add(f'domain/{domain}', 'type', 'Domain', {'name': domain, 'subdomain': subdomain})
+
+        # ── 1. 엔티티 추출 ───────────────────────────────────────────────────
+        logger.info("엔티티 레이어 추출 중...")
+        result = self._call_gemini(EXTRACTION_PROMPT.format(
+            domain=domain, subdomain=subdomain, content=content
+        ))
         if not result:
             return
 
-        concepts_raw: List[str]          = result.get('concepts', [])
-        relations_raw: List[Dict]        = result.get('relations', [])
-        mentions_raw: Dict[str, List[str]]= result.get('mentions', {})
+        entities_raw: List[Dict]          = result.get('entities', [])
+        relations_raw: List[Dict]         = result.get('relations', [])
+        mentions_raw: Dict[str, List[str]] = result.get('mentions', {})
 
-        logger.info(f"  Gemini 반환: concepts={len(concepts_raw)}, "
+        logger.info(f"  Gemini 반환: entities={len(entities_raw)}, "
                     f"relations={len(relations_raw)}, "
                     f"mentions_entries={len(mentions_raw)}")
 
-        # ── 1. Concept 노드 ──────────────────────────────────────────────────
-        registered: Dict[str, str] = {}
-        for name in concepts_raw:
-            norm = self.normalizer.normalize(name)
-            slug = ConceptNormalizer.to_slug(norm)
+        # ── 2. Entity 노드 ───────────────────────────────────────────────────
+        registered: Dict[str, str] = {}  # raw_name → slug
+        for entry in entities_raw:
+            name      = entry.get('name', '') if isinstance(entry, dict) else entry
+            ent_type  = entry.get('type', 'concept') if isinstance(entry, dict) else 'concept'
+            if ent_type not in ENTITY_TYPES:
+                ent_type = 'concept'
+            norm  = self.normalizer.normalize(name)
+            slug  = ConceptNormalizer.to_slug(norm)
             if not slug:
                 continue
             registered[name] = slug
             display = ConceptNormalizer.to_display_name(norm)
-            self.c.add(f'concept/{slug}', 'type', 'Concept', {'name': display})
+            self.c.add(f'concept/{slug}', 'type', 'Concept', {
+                'name':        display,
+                'entity_type': ent_type,
+            })
 
         slug_set = set(registered.values())
 
-        # ── 2. MENTIONS / APPEARS_IN 트리플 ─────────────────────────────────
-        for concept_name, source_ids in mentions_raw.items():
-            norm = self.normalizer.normalize(concept_name)
+        # ── 3. MENTIONS / APPEARS_IN 트리플 ─────────────────────────────────
+        for entity_name, source_ids in mentions_raw.items():
+            norm = self.normalizer.normalize(entity_name)
             slug = ConceptNormalizer.to_slug(norm)
             if slug not in slug_set:
                 continue
@@ -406,11 +454,10 @@ class ConceptLayerBuilder:
                         'end':      seg_data['end'],
                     })
                 elif source_id.startswith('slide_'):
-                    # 슬라이드 자체가 개념을 포함
                     if source_id in self.pre.slide_map:
                         self.c.add(source_id, 'APPEARS_IN', f'concept/{slug}')
 
-        # ── 3. concept↔concept 관계 ──────────────────────────────────────────
+        # ── 4. entity↔entity 관계 ────────────────────────────────────────────
         for rel in relations_raw:
             from_raw = rel.get('from', '')
             to_raw   = rel.get('to', '')
@@ -425,7 +472,7 @@ class ConceptLayerBuilder:
                 continue
             self.c.add(f'concept/{from_slug}', rel_type, f'concept/{to_slug}')
 
-        logger.info(f"✓ 개념 레이어 완료: concept {len(slug_set)}개")
+        logger.info(f"✓ 엔티티 레이어 완료: entity {len(slug_set)}개")
 
     def _build_full_content(self) -> str:
         """
@@ -456,8 +503,7 @@ class ConceptLayerBuilder:
 
         return '\n'.join(lines)
 
-    def _extract(self, content: str) -> Optional[Dict]:
-        prompt = EXTRACTION_PROMPT.format(content=content)
+    def _call_gemini(self, prompt: str) -> Optional[Dict]:
         try:
             response = self.client.models.generate_content(model=self.cfg.gemini_model, contents=prompt)
             text = response.text
@@ -467,7 +513,7 @@ class ConceptLayerBuilder:
                 text = text.split('```')[1].split('```')[0]
             return json.loads(text.strip())
         except Exception as e:
-            logger.error(f"  ✗ Gemini 추출 실패: {e}")
+            logger.error(f"  ✗ Gemini 호출 실패: {e}")
             return None
 
 
