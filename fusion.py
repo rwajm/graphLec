@@ -125,7 +125,8 @@ def score_slide_emphasis(slide_emphasis_items: list[dict]) -> float:
     """slide_classified의 slide_emphasis 배열 → 시각 강조 점수."""
     total = 0.0
     for item in slide_emphasis_items:
-        t = (item.get("type") or "other").lower()
+        raw_type = item.get("type") or "other"
+        t = (raw_type[0] if isinstance(raw_type, list) else raw_type).lower()
         total += SLIDE_EMPHASIS_WEIGHTS.get(t, SLIDE_EMPHASIS_WEIGHTS["other"])
     return round(total, 3)
 

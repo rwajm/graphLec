@@ -588,7 +588,7 @@ def stage5_fusion(
     audio_result: dict,
     output_dir: Path,
 ) -> dict:
-    from fusion import fuse_final
+    from fusion import Config as FusionConfig, run_fusion
 
     stem = Path(args.input).stem
     fused_path = output_dir / f"{stem}_fused.json"
@@ -599,33 +599,72 @@ def stage5_fusion(
     _banner("Stage 5  —  퓨전  (fusion)")
     t0 = time.time()
 
-    with open(textualized_path, "r", encoding="utf-8") as f:
-        tex_data = json.load(f)
-    with open(annotation_path, "r", encoding="utf-8") as f:
-        annotation_data = json.load(f)
-
-    slide_emphasis_by_index: dict[int, list[dict]] = {
-        s["slide_number"]: s.get("slide_emphasis", [])
-        for s in tex_data.get("slides", [])
-        if isinstance(s.get("slide_number"), int)
-    }
-
-    fused = fuse_final(
-        slides_structure=audio_result.get("slides_structure") or [],
-        slide_emphasis_by_index=slide_emphasis_by_index,
-        annotation_data=annotation_data,
-        annotated_segments=audio_result.get("annotated_segments", []),
+    cfg = FusionConfig(
+        stem=stem,
+        output_dir=output_dir,
+        slides_dir=Path(args.slides),
+        audio_path=output_dir / f"{stem}_by_slide.json",
+        classified_path=output_dir / f"{stem}_slide_classified.json",
+        annotation_path=Path(annotation_path),
+        output_path=fused_path,
     )
+    fused_output = run_fusion(cfg)
 
-    _save_json(fused_path, {
-        "video_path": args.input,
-        "description": "영상(slide+annotation) + 오디오 퓨전 결과",
-        "slide_count": len(fused),
-        "slides": fused,
-    })
+    # run_fusion 반환 스키마를 메인 파이프라인 출력 형식에 맞게 감싼다.
+    _save_json(
+        fused_path,
+        {
+            "video_path": args.input,
+            "description": "영상(slide+annotation) + 오디오 퓨전 결과",
+            "slide_count": len(fused_output.get("slides", [])),
+            "fusion_metadata": fused_output.get("metadata", {}),
+            "slides": fused_output.get("slides", []),
+        },
+    )
     elapsed = time.time() - t0
-    _done(f"슬라이드 {len(fused)}개 퓨전", elapsed)
+    _done(f"슬라이드 {len(fused_output.get('slides', []))}개 퓨전", elapsed)
     return {"fused_path": str(fused_path), "elapsed": elapsed}
+
+
+def stage6_graph_triples(args, output_dir: Path, slides_dir: Path) -> dict:
+    from json_to_graph_triples import Config as TripleConfig, GraphPipeline
+
+    stem = Path(args.input).stem
+    csv_path = output_dir / f"{stem}_graph_triples.csv"
+
+    if _is_done(csv_path, "Stage 6 그래프 트리플 생성", args.force):
+        return {"csv_path": str(csv_path), "elapsed": 0.0}
+
+    _banner("Stage 6  —  그래프 트리플 생성  (json_to_graph_triples)")
+    t0 = time.time()
+
+    cfg = TripleConfig(
+        stem=stem,
+        output_dir=output_dir,
+        slides_dir=slides_dir,
+    )
+    GraphPipeline(cfg).run()
+
+    elapsed = time.time() - t0
+    _done("그래프 트리플 생성", elapsed)
+    return {"csv_path": str(csv_path), "elapsed": elapsed}
+
+
+def stage7_graph_import(args, csv_path: str, output_dir: Path, slides_dir: Path) -> dict:
+    from import_graph import import_graph, resolve_csv_path
+
+    stem = Path(args.input).stem
+    resolved_csv = Path(csv_path) if csv_path else resolve_csv_path(stem, output_dir, slides_dir)
+
+    if not resolved_csv.exists():
+        raise FileNotFoundError(f"그래프 CSV 파일 없음: {resolved_csv}")
+
+    _banner("Stage 7  —  그래프 DB 적재  (import_graph)")
+    t0 = time.time()
+    import_graph(resolved_csv, reset=args.neo4j_reset)
+    elapsed = time.time() - t0
+    _done("그래프 DB 적재", elapsed)
+    return {"csv_path": str(resolved_csv), "elapsed": elapsed}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -746,6 +785,24 @@ def run_pipeline(args):
         )
         timings["Stage 5 퓨전"] = r5["elapsed"]
 
+        graph_csv_path = ""
+        if args.skip_graph_triples:
+            print("\n  ⏭  Stage 6 그래프 트리플 생성 — 사용자 옵션으로 스킵")
+            print("─" * 70)
+            timings["Stage 6 그래프 트리플"] = 0.0
+        else:
+            r6 = stage6_graph_triples(args, output_dir, slides_dir)
+            graph_csv_path = r6["csv_path"]
+            timings["Stage 6 그래프 트리플"] = r6["elapsed"]
+
+        if args.skip_graph_import:
+            print("\n  ⏭  Stage 7 그래프 DB 적재 — 사용자 옵션으로 스킵")
+            print("─" * 70)
+            timings["Stage 7 그래프 적재"] = 0.0
+        else:
+            r7 = stage7_graph_import(args, graph_csv_path, output_dir, slides_dir)
+            timings["Stage 7 그래프 적재"] = r7["elapsed"]
+
         # ── 생성된 파일 목록 ──
         print("\n  생성된 파일:")
         output_files = [
@@ -758,6 +815,7 @@ def run_pipeline(args):
             classified_result.get("classified_path", ""),
             by_slide_result.get("by_slide_path", ""),
             r5.get("fused_path", ""),
+            graph_csv_path,
         ]
         for path_str in output_files:
             if not path_str:
@@ -799,6 +857,7 @@ def main():
   python main.py --input input/lecture.mp4 --skip-extract
   python main.py --input input/lecture.mp4 --debug --masks
   python main.py --input input/lecture.mp4 --force
+  python main.py --input input/lecture.mp4 --skip-graph-import
         """,
     )
     parser.add_argument("--input",  "-i", default="input/lecture.mp4", help="입력 강의 영상 경로 (.mp4)")
@@ -814,6 +873,12 @@ def main():
                         help="Gemini API 재시도 횟수 (default: 3)")
     parser.add_argument("--debug", action="store_true", help="Stage 1 디버그 로그 출력")
     parser.add_argument("--masks", action="store_true", help="Stage 3A diff 마스크 이미지 저장")
+    parser.add_argument("--skip-graph-triples", action="store_true",
+                        help="Stage 6 그래프 트리플 CSV 생성 스킵")
+    parser.add_argument("--skip-graph-import", action="store_true",
+                        help="Stage 7 Neo4j 그래프 적재 스킵")
+    parser.add_argument("--neo4j-reset", action="store_true",
+                        help="Stage 7 실행 시 기존 그래프 삭제 후 재적재")
 
     args = parser.parse_args()
 

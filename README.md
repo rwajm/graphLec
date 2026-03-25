@@ -64,7 +64,7 @@ pip install -r requirements.txt
 전체 실행
 Bash
 
-python main.py --video input/lecture.mp4
+python main.py --input input/lecture.mp4
 
 주요 옵션
 

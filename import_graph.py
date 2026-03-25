@@ -19,7 +19,7 @@ from collections import defaultdict
 from neo4j import GraphDatabase
 
 # ── Neo4j 연결 설정 ──
-URI      = "bolt://localhost:7687"
+URI      = "bolt://127.0.0.1:7687"
 USERNAME = "neo4j"
 PASSWORD = "rhlh1234"
 # ────────────────────
