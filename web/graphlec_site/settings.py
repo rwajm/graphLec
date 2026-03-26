@@ -1,8 +1,7 @@
 """
 Django settings for GraphLEC web (프록시 + 강의 메타).
 
-로컬: USE_SQLITE=1 (기본) → db.sqlite3
-운영: USE_SQLITE=0 + POSTGRES_* 환경변수
+로컬 테스트 단순화를 위해 SQLite 단일 DB를 사용한다.
 """
 
 import os
@@ -63,26 +62,14 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "graphlec_site.wsgi.application"
 
-USE_SQLITE = os.getenv("USE_SQLITE", "1") == "1"
+USE_SQLITE = True
 
-if USE_SQLITE:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
-        }
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "db.sqlite3",
     }
-else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.getenv("POSTGRES_DB", "graphlec"),
-            "USER": os.getenv("POSTGRES_USER", "graphlec"),
-            "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
-            "HOST": os.getenv("POSTGRES_HOST", "localhost"),
-            "PORT": os.getenv("POSTGRES_PORT", "5432"),
-        }
-    }
+}
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
