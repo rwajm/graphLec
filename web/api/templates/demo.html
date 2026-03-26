@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>GraphLEC 데모</title>
+  <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --card: #fff;
+      --border: #e2e5eb;
+      --text: #1a1d26;
+      --muted: #5c6370;
+      --accent: #2563eb;
+      --err: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 1.25rem 1rem 2rem;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .wrap { max-width: 1200px; margin: 0 auto; }
+    h1 { font-size: 1.35rem; font-weight: 650; margin: 0 0 0.35rem; }
+    .lead { color: var(--muted); font-size: 0.92rem; margin: 0 0 1.25rem; }
+    label { display: block; margin-top: 0.85rem; font-weight: 600; font-size: 0.88rem; }
+    select, textarea, button {
+      width: 100%;
+      margin-top: 0.35rem;
+      font-size: 1rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      padding: 0.55rem 0.65rem;
+      background: var(--card);
+    }
+    textarea { min-height: 88px; resize: vertical; }
+    button {
+      margin-top: 0.85rem;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      font-weight: 600;
+      padding: 0.65rem 1rem;
+    }
+    button:hover { filter: brightness(1.05); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    button.secondary {
+      background: #64748b;
+      margin-top: 0.5rem;
+    }
+    button.secondary:hover { filter: brightness(1.08); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-top: 1.25rem;
+      align-items: start;
+    }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.1rem;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .card h2 {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin: 0 0 0.65rem;
+      font-weight: 700;
+    }
+    .answer-body {
+      font-size: 1.02rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .answer-body.empty { color: var(--muted); font-style: italic; }
+
+    .chunk-list { margin: 0; padding: 0; list-style: none; }
+    .chunk-list li {
+      border-top: 1px solid var(--border);
+      padding: 0.65rem 0;
+      font-size: 0.9rem;
+    }
+    .chunk-list li:first-child { border-top: none; padding-top: 0; }
+    .chunk-meta {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+    }
+    .chunk-text { color: var(--text); }
+
+    .ts-line { font-size: 0.82rem; color: var(--muted); margin-top: 0.5rem; }
+
+    /* vis-network는 부모에 명시된 height가 없으면 캔버스가 위쪽 얇은 띠로만 그려짐 (flex:1만으로는 부족) */
+    .graph-panel { display: flex; flex-direction: column; gap: 0.5rem; }
+    #graph, #graph-full {
+      width: 100%;
+      height: 420px;
+      min-height: 280px;
+      border-radius: 8px;
+      background: #fafbfc;
+      border: 1px solid var(--border);
+      position: relative;
+      overflow: hidden;
+    }
+    #graph-full {
+      height: min(520px, 70vh);
+    }
+    @media (max-width: 900px) {
+      #graph, #graph-full { height: 360px; }
+    }
+    .graph-hint { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; }
+    .section-gap { margin-top: 1.5rem; }
+
+    .status { margin-top: 0.75rem; font-size: 0.9rem; color: var(--muted); }
+    .err { color: var(--err); }
+    details.raw { margin-top: 1rem; font-size: 0.82rem; color: var(--muted); }
+    details.raw pre {
+      background: #eef0f4;
+      padding: 0.75rem;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 200px;
+      font-size: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>GraphLEC 질의 데모</h1>
+    <p class="lead">브라우저는 Django만 호출합니다. Django가 FastAPI 질의 서비스로 프록시합니다.</p>
+
+    <label for="lecture">강의</label>
+    <select id="lecture">
+      {% for lec in lectures %}
+        <option value="{{ lec.id }}">{{ lec.title|default:lec.stem }} (stem: {{ lec.stem }})</option>
+      {% empty %}
+        <option value="">— 강의 없음 (Admin에서 Lecture 추가) —</option>
+      {% endfor %}
+    </select>
+
+    <label for="question">질문</label>
+    <textarea id="question" placeholder="예: 이 강의에서 핵심 개념은 무엇인가요?"></textarea>
+
+    <button type="button" id="send">질문 보내기</button>
+    <div class="status" id="status"></div>
+
+    <div class="grid">
+      <div class="col-left">
+        <div class="card">
+          <h2>답변</h2>
+          <div id="answer" class="answer-body empty">응답이 여기에 표시됩니다.</div>
+        </div>
+        <div class="card" style="margin-top: 1rem;">
+          <h2>근거 · 출처</h2>
+          <ul class="chunk-list" id="sources"></ul>
+        </div>
+        <div class="card" style="margin-top: 1rem;" id="ts-wrap" hidden>
+          <h2>시간 구간</h2>
+          <div id="timestamps"></div>
+        </div>
+      </div>
+      <div class="col-right">
+        <div class="card graph-panel">
+          <h2>지식 그래프 (검색 근거)</h2>
+          <div id="graph"></div>
+          <p class="graph-hint">노드에 마우스를 올리면 청크 요약을 볼 수 있습니다. 드래그로 배치를 조정할 수 있습니다.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-gap card">
+      <h2>강의 전체 지식 그래프</h2>
+      <p class="graph-hint" style="margin-top: 0;">
+        파이프라인 Stage 6에서 저장한 <code>{stem}_nodes.parquet</code> · <code>{stem}_edges.parquet</code>
+        (환경변수 <code>GRAPHLEC_OUTPUT_DIR</code>, 기본: 프로젝트 <code>output/</code>)를 불러옵니다.
+      </p>
+      <button type="button" class="secondary" id="load-full-graph">선택한 강의 전체 그래프 불러오기</button>
+      <div class="status" id="full-graph-status"></div>
+      <div id="graph-full" style="margin-top: 0.75rem;"></div>
+      <p class="graph-hint">노드·관계가 많으면 첫 배치에 시간이 걸릴 수 있습니다.</p>
+    </div>
+
+    <details class="raw">
+      <summary>원본 JSON (디버그)</summary>
+      <pre id="raw">(요청 전)</pre>
+    </details>
+  </div>
+
+  <script>
+    const csrfToken = "{{ csrf_token }}";
+    const netQuery = { ref: null };
+    const netFull = { ref: null };
+
+    function setAnswer(text) {
+      const el = document.getElementById("answer");
+      const t = (text || "").trim();
+      if (!t) {
+        el.textContent = "응답이 비어 있습니다.";
+        el.classList.add("empty");
+        return;
+      }
+      el.textContent = text;
+      el.classList.remove("empty");
+    }
+
+    function renderSources(chunks) {
+      const ul = document.getElementById("sources");
+      ul.innerHTML = "";
+      if (!chunks || !chunks.length) {
+        const li = document.createElement("li");
+        li.className = "chunk-meta";
+        li.textContent = "표시할 근거 청크가 없습니다.";
+        ul.appendChild(li);
+        return;
+      }
+      for (const c of chunks) {
+        const li = document.createElement("li");
+        const meta = document.createElement("div");
+        meta.className = "chunk-meta";
+        const parts = [];
+        if (c.slide_number != null) parts.push("슬라이드 " + c.slide_number);
+        if (c.start_sec != null) {
+          let t = c.start_sec.toFixed(1) + "초";
+          if (c.end_sec != null) t += " – " + c.end_sec.toFixed(1) + "초";
+          parts.push(t);
+        }
+        if (c.chunk_type) parts.push(c.chunk_type);
+        if (c.score != null) parts.push("유사도 " + c.score.toFixed(3));
+        meta.textContent = parts.join(" · ") || (c.chunk_id || "");
+        const tx = document.createElement("div");
+        tx.className = "chunk-text";
+        tx.textContent = (c.text || "").slice(0, 1200);
+        li.appendChild(meta);
+        li.appendChild(tx);
+        ul.appendChild(li);
+      }
+    }
+
+    function renderTimestamps(ts) {
+      const wrap = document.getElementById("ts-wrap");
+      const out = document.getElementById("timestamps");
+      out.innerHTML = "";
+      if (!ts || !ts.length) {
+        wrap.hidden = true;
+        return;
+      }
+      wrap.hidden = false;
+      for (const x of ts) {
+        const div = document.createElement("div");
+        div.className = "ts-line";
+        let s = "";
+        if (x.start != null) s += x.start.toFixed(1) + "s";
+        if (x.end != null) s += " – " + x.end.toFixed(1) + "s";
+        if (s) s += " — ";
+        s += x.label || "";
+        div.textContent = s;
+        out.appendChild(div);
+      }
+    }
+
+    function edgeToVis(e, i) {
+      const from = e.from != null ? e.from : e.src_id != null ? e.src_id : e.source;
+      const to = e.to != null ? e.to : e.tgt_id != null ? e.tgt_id : e.target;
+      if (from == null || to == null) return null;
+      return {
+        id: "e" + i,
+        from: String(from),
+        to: String(to),
+        label: e.label || e.rel_type || "",
+      };
+    }
+
+    function renderGraph(graph, containerId, netHolder, layoutOpts) {
+      layoutOpts = layoutOpts || {};
+      const container = document.getElementById(containerId);
+      if (typeof vis === "undefined" || !vis.DataSet || !vis.Network) {
+        container.textContent = "vis-network 로드를 실패했습니다.";
+        return;
+      }
+      const g = graph || { nodes: [], edges: [] };
+      const rawNodes = g.nodes || [];
+      const rawEdges = g.edges || [];
+      const nCount = rawNodes.length;
+
+      const nodes = new vis.DataSet(rawNodes.map(function (n) {
+        const id = n.id != null ? String(n.id) : "n";
+        const bg = n.color || "#6b7280";
+        const fontSize = nCount > 400 ? 11 : 13;
+        return {
+          id: id,
+          label: (n.label || id).slice(0, 48),
+          title: (n.title || n.label || "").slice(0, 500),
+          color: { background: bg, border: "#374151", highlight: { background: bg, border: "#111" } },
+          font: { color: "#111827", size: fontSize },
+        };
+      }));
+
+      const edgeRows = [];
+      rawEdges.forEach(function (e, i) {
+        const row = edgeToVis(e, i);
+        if (row) edgeRows.push(row);
+      });
+      const edges = new vis.DataSet(edgeRows);
+
+      const data = { nodes: nodes, edges: edges };
+      const heavy = layoutOpts.large || nCount > 400;
+      const options = {
+        nodes: { borderWidth: 2, shadow: !heavy },
+        edges: {
+          arrows: "to",
+          smooth: { type: heavy ? "continuous" : "dynamic" },
+          font: { size: 10, align: "middle" },
+        },
+        physics: heavy
+          ? {
+              enabled: true,
+              stabilization: { iterations: Math.min(80 + Math.floor(nCount / 20), 400) },
+              barnesHut: {
+                gravitationalConstant: -5000,
+                springLength: 180,
+                springConstant: 0.04,
+                damping: 0.5,
+              },
+            }
+          : {
+              enabled: true,
+              stabilization: { iterations: 120 },
+              barnesHut: { gravitationalConstant: -2500, springLength: 140 },
+            },
+        interaction: { hover: true, tooltipDelay: 80 },
+      };
+
+      if (netHolder.ref) {
+        netHolder.ref.destroy();
+        netHolder.ref = null;
+      }
+      netHolder.ref = new vis.Network(container, data, options);
+      const net = netHolder.ref;
+      requestAnimationFrame(function () {
+        if (!netHolder.ref || netHolder.ref !== net) return;
+        try {
+          net.fit({ animation: false });
+        } catch (e) { /* ignore */ }
+      });
+      function fitAfterStable() {
+        net.off("stabilizationIterationsDone", fitAfterStable);
+        try {
+          net.fit({ animation: true });
+        } catch (e) { /* ignore */ }
+      }
+      net.on("stabilizationIterationsDone", fitAfterStable);
+    }
+
+    document.getElementById("send").onclick = async () => {
+      const lectureId = document.getElementById("lecture").value;
+      const question = document.getElementById("question").value.trim();
+      const status = document.getElementById("status");
+      const raw = document.getElementById("raw");
+      const btn = document.getElementById("send");
+
+      if (!lectureId) {
+        status.innerHTML = '<span class="err">강의를 선택하거나 Admin에서 Lecture를 등록하세요.</span>';
+        return;
+      }
+
+      status.textContent = "요청 중…";
+      btn.disabled = true;
+      raw.textContent = "…";
+
+      try {
+        const r = await fetch("/api/query/", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": csrfToken,
+          },
+          body: JSON.stringify({ lecture_id: Number(lectureId), question: question }),
+        });
+        const data = await r.json();
+        raw.textContent = JSON.stringify(data, null, 2);
+
+        if (!r.ok) {
+          const msg = data.detail || data.message || ("HTTP " + r.status);
+          const ans = document.getElementById("answer");
+          ans.textContent = String(msg);
+          ans.classList.add("empty");
+          status.innerHTML = '<span class="err">요청이 실패했습니다.</span>';
+          renderSources([]);
+          renderTimestamps([]);
+          renderGraph({ nodes: [], edges: [] }, "graph", netQuery, {});
+          return;
+        }
+
+        status.textContent = "";
+        setAnswer(data.answer);
+        renderSources(data.retrieved_chunks || []);
+        renderTimestamps(data.timestamps || []);
+        renderGraph(data.graph, "graph", netQuery, {});
+      } catch (e) {
+        status.innerHTML = '<span class="err">' + String(e) + "</span>";
+        raw.textContent = String(e);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    document.getElementById("load-full-graph").onclick = async () => {
+      const lectureId = document.getElementById("lecture").value;
+      const st = document.getElementById("full-graph-status");
+      const btn = document.getElementById("load-full-graph");
+      if (!lectureId) {
+        st.innerHTML = '<span class="err">강의를 먼저 선택하세요.</span>';
+        return;
+      }
+      st.textContent = "Parquet 로드 중…";
+      btn.disabled = true;
+      try {
+        const r = await fetch("/api/graph/full/", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": csrfToken,
+          },
+          body: JSON.stringify({ lecture_id: Number(lectureId) }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          st.innerHTML = '<span class="err">' + String(data.detail || data.message || r.status) + "</span>";
+          return;
+        }
+        st.textContent = "stem: " + data.stem + " · 노드 " + data.node_count + " · 엣지 " + data.edge_count;
+        renderGraph(data.graph, "graph-full", netFull, { large: (data.node_count || 0) > 200 });
+      } catch (e) {
+        st.innerHTML = '<span class="err">' + String(e) + "</span>";
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>
