@@ -15,10 +15,10 @@ from .graph_loader import load_kg_from_parquet
 logger = logging.getLogger(__name__)
 
 
-def demo_home(request):
-    """데모: 강의 선택 + 질문 (브라우저는 Django만 호출)."""
+def query_home(request):
+    """강의 선택 + 질문 화면 (브라우저는 Django만 호출)."""
     lectures = Lecture.objects.all()
-    return render(request, "demo.html", {"lectures": lectures})
+    return render(request, "query_home.html", {"lectures": lectures})
 
 
 @require_GET

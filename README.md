@@ -1,6 +1,6 @@
 # GraphLec: 통합 강의 분석 및 지식그래프 생성 파이프라인
 
-GraphLec은 강의 영상에서 시각적 정보(슬라이드)와 청각적 정보(음성)를 결합하여, 고정밀 전사, 강조 구간 분석, **지식 그래프(Parquet)**·**벡터 검색(LanceDB)**·**웹 질의 데모(Django + FastAPI)**까지 이어지는 멀티모달 파이프라인입니다.
+GraphLec은 강의 영상에서 시각적 정보(슬라이드)와 청각적 정보(음성)를 결합하여, 고정밀 전사, 강조 구간 분석, **지식 그래프(Parquet)**·**벡터 검색(LanceDB)**·**웹 질의(Django + FastAPI)**까지 이어지는 멀티모달 파이프라인입니다.
 
 ---
 
@@ -22,7 +22,7 @@ GraphLec은 강의 영상에서 시각적 정보(슬라이드)와 청각적 정�
 - 멀티모달 통합: 슬라이드 텍스트와 오디오 전사를 타임스탬프 기준으로 병합(`fused.json`)합니다.
 - 지식 그래프: 개념·관계 트리플을 수집해 `{stem}_graph_triples.parquet`, `{stem}_nodes.parquet`, `{stem}_edges.parquet`로 저장합니다.
 - 벡터 검색: 청크 임베딩 후 LanceDB(`data/lancedb` 등)에 적재하여 stem 단위 검색합니다.
-- 질의응답: FastAPI 질의 서비스 + Django 데모 UI에서 자연어 질의에 답합니다.
+- 질의응답: FastAPI 질의 서비스 + Django 웹 UI에서 자연어 질의에 답합니다.
 
 ---
 
@@ -40,7 +40,7 @@ GraphLec은 강의 영상에서 시각적 정보(슬라이드)와 청각적 정�
     ├─ Stage 6 그래프 트리플 → Parquet (triples / nodes / edges)
     └─ Stage 7 Lance 인덱스 → Parquet 백업 + LanceDB
 
-질의: LanceDB 검색 + Gemini 답변 (query_service) ← Django 데모가 프록시
+질의: LanceDB 검색 + Gemini 답변 (query_service) ← Django 웹이 프록시
 ```
 
 ---
@@ -116,7 +116,7 @@ opencv-python, numpy, Pillow, google-generativeai, google-genai, groq, torch, tr
 
 ### 구성
 
-- **Django** (`web/`): 강의 메타(`Lecture`), 데모 페이지, `/api/query/`·`/api/graph/full/` 등
+- **Django** (`web/`): 강의 메타(`Lecture`), 질의 페이지, `/api/query/`·`/api/graph/full/` 등
 - **FastAPI** (`query_service/`): `POST /internal/query` — `stem` + `question`(LanceDB 검색 + Gemini 답변)
 
 ### 실행 (터미널 2개, 프로젝트 루트에서 가상환경 활성화 후)
@@ -135,10 +135,8 @@ python manage.py migrate
 python manage.py runserver 8000
 ```
 
-선택: `python manage.py loaddata demo_lectures` — 데모 픽스처가 있을 때만.
-
 브라우저: `http://127.0.0.1:8000/`  
-Admin에서 `Lecture`의 **stem**을 `main.py` 입력 영상 파일명(stem)과 동일하게 맞춥니다.
+`main.py` 실행이 완료되면 해당 영상의 `stem`이 자동으로 `Lecture`에 등록됩니다.
 
 ### 환경 변수 (웹·질의 연동)
 
@@ -148,10 +146,10 @@ Admin에서 `Lecture`의 **stem**을 `main.py` 입력 영상 파일명(stem)과 
 - `GOOGLE_API_KEY` 등 — Gemini(질의 서비스·파이프라인과 공통 키 이름 사용 가능)
 
 질의 서비스는 **프로젝트 루트**에서 실행하는 것을 권장합니다(`python main.py`로 만든 LanceDB 경로와 맞추기 쉬움).  
-Django 실행 시에도 `GRAPHLEC_OUTPUT_DIR` 등을 쓰려면 셸에서 `.env`를 `export`하거나, `set -a && source .env && set +a` 후 `runserver`를 실행합니다.
+Django는 로컬 테스트 기준으로 SQLite(`web/db.sqlite3`)를 사용합니다.
 
 ---
 
-## 8. PostgreSQL 사용 시 (선택)
+## 8. 데이터베이스
 
-`web/graphlec_site/settings.py`에서 `USE_SQLITE=0`과 `POSTGRES_*` 환경 변수를 설정합니다.
+로컬 테스트는 SQLite 단일 DB(`web/db.sqlite3`)로 동작합니다.
