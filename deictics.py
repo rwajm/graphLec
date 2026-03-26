@@ -1,7 +1,7 @@
 import json
 import re
 from collections import Counter
-from typing import Any
+from typing import Any, Optional
 
 from google.genai import types
 
@@ -90,7 +90,7 @@ def normalize_word_items(words: Any, chunk_start: float = 0.0) -> list[dict]:
     return out
 
 
-def _is_discourse_continuation_deictic(deictic: str, next_token: str | None) -> bool:
+def _is_discourse_continuation_deictic(deictic: str, next_token: Optional[str]) -> bool:
     if deictic not in {"이", "그", "저"}:
         return False
     return (next_token or "").strip() in _DISCOURSE_NEXT_TOKENS
