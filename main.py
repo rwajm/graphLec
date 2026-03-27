@@ -15,6 +15,8 @@ main.py
   [병렬] Stage 4A: slide_classifier    — 슬라이드 역할 분류
          Stage 4B: by_slide 구조 저장  — (3B 결과 기반)
   [직렬] Stage 5 : fusion              — 최종 통합
+  [직렬] Stage 6 : 그래프 Parquet       — json_to_graph_triples
+  [직렬] Neo4j 적재 (옵션 스킵)        — nodes/edges Parquet → Neo4j
   [직렬] Stage 7 : lance_ingest          — fused → Parquet + LanceDB (Gemini 임베딩, stem 필터)
 
 Usage:
@@ -863,9 +865,26 @@ def run_pipeline(args):
             print("\n  ⏭  Stage 6 그래프 트리플 생성 — 사용자 옵션으로 스킵")
             print("─" * 70)
             timings["Stage 6 그래프 트리플"] = 0.0
+            timings["Neo4j 적재"] = 0.0
         else:
             r6 = stage6_graph_triples(args, output_dir, slides_dir)
             timings["Stage 6 그래프 트리플"] = r6["elapsed"]
+
+            if not getattr(args, "skip_neo4j", False):
+                from neo4j_ingest import stage_neo4j_ingest
+
+                _banner("Neo4j 적재  —  nodes/edges Parquet → Neo4j")
+                t_neo = time.time()
+                r_neo = stage_neo4j_ingest(args, output_dir)
+                timings["Neo4j 적재"] = time.time() - t_neo
+                _done(
+                    f"Neo4j (노드 {r_neo['node_count']}, 관계 {r_neo['edge_count']})",
+                    timings["Neo4j 적재"],
+                )
+            else:
+                print("\n  ⏭  Neo4j 적재 — 사용자 옵션으로 스킵")
+                print("─" * 70)
+                timings["Neo4j 적재"] = 0.0
 
         if args.skip_lance_index:
             print("\n  ⏭  Stage 7 Lance 인덱스 — 사용자 옵션으로 스킵")
@@ -936,6 +955,7 @@ def main():
   python main.py --input input/lecture.mp4 --debug --masks
   python main.py --input input/lecture.mp4 --force
   python main.py --input input/lecture.mp4 --skip-lance-index
+  python main.py --input input/lecture.mp4 --skip-neo4j
         """,
     )
     parser.add_argument("--input",  "-i", default="input/lecture.mp4", help="입력 강의 영상 경로 (.mp4)")
@@ -953,6 +973,11 @@ def main():
     parser.add_argument("--masks", action="store_true", help="Stage 3A diff 마스크 이미지 저장")
     parser.add_argument("--skip-graph-triples", action="store_true",
                         help="Stage 6 그래프 Parquet(triples/nodes/edges) 생성 스킵")
+    parser.add_argument(
+        "--skip-neo4j",
+        action="store_true",
+        help="Stage 6 직후 Neo4j 적재 스킵 (기본은 적재 시도; NEO4J_URI 등 필요)",
+    )
     parser.add_argument("--skip-lance-index", action="store_true",
                         help="Stage 7 LanceDB+Parquet 인덱스 스킵")
     parser.add_argument(
