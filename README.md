@@ -38,6 +38,7 @@ GraphLec은 강의 영상에서 시각적 정보(슬라이드)와 청각적 정�
     ├─ [병렬] Stage 4A 슬라이드 분류 · Stage 4B by_slide 저장
     ├─ Stage 5 퓨전 → {stem}_fused.json
     ├─ Stage 6 그래프 트리플 → Parquet (triples / nodes / edges)
+    ├─ Neo4j 적재 (기본) — nodes/edges Parquet → Neo4j (`--skip-neo4j`로 생략 가능)
     └─ Stage 7 Lance 인덱스 → Parquet 백업 + LanceDB
 
 질의: LanceDB 검색 + Gemini 답변 (query_service) ← Django 웹이 프록시
@@ -69,6 +70,57 @@ GPU용 PyTorch가 필요하면 `requirements.txt` 상단 주석의 CUDA 인덱�
 
 질의 서비스(`query_service`)는 `GOOGLE_API_KEY_2`·`GOOGLE_API_KEY`·`GEMINI_API_KEY` 등으로 Gemini를 찾습니다. LanceDB 경로는 `GRAPHLEC_LANCE_ROOT`(미설정 시 저장소 루트의 `data/lancedb`).
 
+**Neo4j 적재(Stage 6 직후, 기본 실행)**  
+`main.py`는 Stage 6 이후 Parquet를 Neo4j에 올립니다. Neo4j 서버가 없거나 당분간 쓰지 않을 때는 실행 시 **`--skip-neo4j`** 를 주면 됩니다 (Parquet 생성은 그대로).  
+연결 실패 시 파이프라인은 **오류로 중단**됩니다.
+
+#### Neo4j 설치·실행 (로컬, 둘 중 하나면 됨)
+
+**방법 A — Neo4j Desktop (GUI, 처음 쓸 때 무난함)**  
+
+1. [Neo4j Desktop 다운로드](https://neo4j.com/download/) 후 OS에 맞게 설치한다.  
+2. 앱을 연 뒤 **New project** → **Add** → **Local DB** 로 로컬 데이터베이스를 만든다.  
+3. DB를 선택하고 비밀번호를 정한다(또는 첫 실행 시 안내에 따라 설정).  
+4. **Start** 로 DB를 켠다.  
+5. **Open** 을 눌러 Neo4j Browser가 열리면 서버가 준비된 것이다.  
+6. Bolt 연결 정보는 보통 다음과 같다(Desktop 하단·설정에서도 확인 가능).  
+   - 주소: `bolt://localhost:7687` 또는 `bolt://127.0.0.1:7687`  
+   - 사용자: `neo4j`  
+   - 비밀번호: 3번에서 설정한 값  
+
+**방법 B — Docker (명령으로만 띄울 때)**  
+
+Docker가 설치되어 있다면 예시는 다음과 같다. `YOUR_PASSWORD` 를 본인 비밀번호로 바꾼다.
+
+```bash
+docker run -d --name graphlec-neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/YOUR_PASSWORD \
+  neo4j:5
+```
+
+- 웹 UI(선택): 브라우저에서 `http://127.0.0.1:7474`  
+- Bolt: `bolt://127.0.0.1:7687`, 사용자 `neo4j`, 비밀번호는 `YOUR_PASSWORD` 와 동일  
+
+컨테이너를 끄려면: `docker stop graphlec-neo4j` — 다시 켤 때: `docker start graphlec-neo4j`  
+
+#### GraphLec `.env` 예시 (프로젝트 루트)
+
+서버가 떠 있는 상태에서 아래를 맞춘다(비밀번호는 위에서 설정한 것과 동일).
+
+```env
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=여기에_비밀번호
+```
+
+자세한 설치·업그레이드·운영은 [Neo4j 공식 문서](https://neo4j.com/docs/)를 보면 된다.
+
+**자주 나오는 문제**  
+
+- `Connection refused`: Neo4j가 **Start**/컨테이너가 **실행 중**인지 확인한다. 방화벽이 **7687** 포트를 막지 않는지 본다.  
+- 비밀번호를 잊었으면: Desktop은 DB 설정에서 재설정, Docker는 컨테이너·볼륨을 지우고 `NEO4J_AUTH` 로 다시 만드는 편이 단순하다.
+
 ---
 
 ## 4. 사용법
@@ -86,6 +138,7 @@ python main.py --input input/lecture.mp4 --output output --slides output_slides
 - `--skip-extract`: 이미 슬라이드가 있을 때 Stage 1A 추출 생략
 - `--force`: 기존 출력이 있어도 강제 재실행
 - `--skip-graph-triples`: Stage 6(그래프 Parquet) 생략
+- `--skip-neo4j`: Stage 6 직후 Neo4j 적재 생략 (`NEO4J_*` 없이 파이프라인만 돌릴 때)
 - `--skip-lance-index`: Stage 7(Lance 인덱스) 생략
 - `--lance-root`: LanceDB 경로(기본: 환경변수 또는 `data/lancedb`)
 - `--debug`, `--masks`: Stage 1 디버그 / Stage 3A 마스크 저장
@@ -106,7 +159,7 @@ python main.py --input input/lecture.mp4 --output output --slides output_slides
 
 ## 6. 요구 사항 (`requirements.txt` 요약)
 
-opencv-python, numpy, Pillow, google-generativeai, google-genai, groq, torch, transformers, librosa, lancedb, pyarrow, pandas, fastapi, uvicorn, django, httpx 등 (전체 목록은 파일 참고).
+opencv-python, numpy, Pillow, google-generativeai, google-genai, groq, torch, transformers, librosa, **neo4j**, lancedb, pyarrow, pandas, fastapi, uvicorn, django, httpx 등 (전체 목록은 파일 참고).
 
 ---
 
