@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -18,6 +19,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
+from neo4j import GraphDatabase
+from neo4j.exceptions import Neo4jError, ServiceUnavailable
 from pydantic import BaseModel, Field
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -36,7 +39,11 @@ app.add_middleware(
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY_2") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 GEMINI_ANSWER_MODEL = os.getenv("GEMINI_ANSWER_MODEL", "gemini-2.0-flash")
 TOP_K = int(os.getenv("GRAPHLEC_TOP_K", "8"))
+GRAPH_TOP_K = int(os.getenv("GRAPHLEC_GRAPH_TOP_K", "12"))
 RETRY_DELAYS = [0, 5, 15, 30]
+NEO4J_URI = os.getenv("NEO4J_URI", "").strip()
+NEO4J_USER = os.getenv("NEO4J_USER", "").strip()
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 
 ANSWER_SYSTEM_PROMPT = """
 너는 강의 영상 분석 결과를 바탕으로 질문에 직접 답하는 어시스턴트야.
@@ -53,6 +60,12 @@ ANSWER_SYSTEM_PROMPT = """
 class InternalQueryRequest(BaseModel):
     stem: str = Field(..., min_length=1)
     question: str = Field(..., min_length=1)
+
+
+class InternalGraphQueryRequest(BaseModel):
+    stem: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1)
+    top_k: int = Field(default=GRAPH_TOP_K, ge=1, le=100)
 
 
 class RetrievedChunk(BaseModel):
@@ -72,6 +85,24 @@ class QueryResponse(BaseModel):
     timestamps: list[dict]
     graph: dict
     retrieved_chunks: list[RetrievedChunk]
+
+
+class GraphEvidence(BaseModel):
+    src_id: str
+    src_labels: list[str]
+    rel_type: str
+    tgt_id: str
+    tgt_labels: list[str]
+    src_text: str = ""
+    tgt_text: str = ""
+
+
+class GraphEvidenceResponse(BaseModel):
+    stem: str
+    question: str
+    keywords: list[str]
+    evidence: list[GraphEvidence]
+    count: int
 
 
 def _gemini_client() -> genai.Client:
@@ -170,9 +201,109 @@ def _chunks_to_graph(chunks: list[RetrievedChunk]) -> dict:
     return {"nodes": nodes, "edges": []}
 
 
+def _extract_keywords(question: str) -> list[str]:
+    parts = re.split(r"[^0-9A-Za-z가-힣_]+", (question or "").lower())
+    out: list[str] = []
+    for p in parts:
+        if len(p) < 2:
+            continue
+        if p not in out:
+            out.append(p)
+    return out[:8]
+
+
+def _neo4j_driver():
+    if not NEO4J_URI or not NEO4J_USER:
+        raise HTTPException(
+            status_code=503,
+            detail="Neo4j 설정이 없습니다. NEO4J_URI/NEO4J_USER/NEO4J_PASSWORD를 확인하세요.",
+        )
+    try:
+        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        driver.verify_connectivity()
+        return driver
+    except (ServiceUnavailable, Neo4jError) as e:
+        raise HTTPException(status_code=503, detail=f"Neo4j 연결 실패: {e}") from e
+
+
+def graph_search_by_stem_question(stem: str, question: str, top_k: int = GRAPH_TOP_K) -> list[GraphEvidence]:
+    keywords = _extract_keywords(question)
+    if not keywords:
+        return []
+
+    driver = _neo4j_driver()
+    try:
+        with driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (a {stem: $stem})-[r]->(b {stem: $stem})
+                WITH a, r, b,
+                     toLower(
+                        coalesce(a.id, '') + ' ' +
+                        coalesce(a.title, '') + ' ' +
+                        coalesce(a.text, '') + ' ' +
+                        coalesce(a.name, '') + ' ' +
+                        coalesce(b.id, '') + ' ' +
+                        coalesce(b.title, '') + ' ' +
+                        coalesce(b.text, '') + ' ' +
+                        coalesce(b.name, '')
+                     ) AS haystack
+                WITH a, r, b, haystack, [kw IN $keywords WHERE haystack CONTAINS kw] AS hits
+                WHERE size(hits) > 0
+                RETURN
+                    coalesce(a.id, '') AS src_id,
+                    labels(a) AS src_labels,
+                    type(r) AS rel_type,
+                    coalesce(b.id, '') AS tgt_id,
+                    labels(b) AS tgt_labels,
+                    coalesce(a.text, a.title, a.name, '') AS src_text,
+                    coalesce(b.text, b.title, b.name, '') AS tgt_text,
+                    size(hits) AS score
+                ORDER BY score DESC, rel_type ASC
+                LIMIT $top_k
+                """,
+                stem=stem,
+                keywords=keywords,
+                top_k=int(top_k),
+            )
+            out: list[GraphEvidence] = []
+            for row in rows:
+                out.append(
+                    GraphEvidence(
+                        src_id=str(row.get("src_id", "")),
+                        src_labels=[str(x) for x in (row.get("src_labels") or [])],
+                        rel_type=str(row.get("rel_type", "")),
+                        tgt_id=str(row.get("tgt_id", "")),
+                        tgt_labels=[str(x) for x in (row.get("tgt_labels") or [])],
+                        src_text=str(row.get("src_text", "") or "")[:800],
+                        tgt_text=str(row.get("tgt_text", "") or "")[:800],
+                    )
+                )
+            return out
+    finally:
+        driver.close()
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/internal/query_graph_evidence", response_model=GraphEvidenceResponse)
+async def internal_query_graph_evidence(req: InternalGraphQueryRequest) -> GraphEvidenceResponse:
+    stem = req.stem.strip()
+    question = req.question.strip()
+    if not stem or not question:
+        raise HTTPException(status_code=400, detail="stem/question은 비어 있을 수 없습니다.")
+
+    evidence = graph_search_by_stem_question(stem=stem, question=question, top_k=req.top_k)
+    return GraphEvidenceResponse(
+        stem=stem,
+        question=question,
+        keywords=_extract_keywords(question),
+        evidence=evidence,
+        count=len(evidence),
+    )
 
 
 @app.post("/internal/query", response_model=QueryResponse)
