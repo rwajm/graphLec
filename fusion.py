@@ -68,12 +68,28 @@ class Config:
 
     # 키워드 필터
     MIN_KEYWORD_LEN: int = 2
+    MIN_SLIDE_TEXT_LINE_LEN: int = 4  # 슬라이드 본문 라인 최소 길이 (불릿·번호 제외)
+    SLIDE_TEXT_SCORE: float = 0.3     # 슬라이드 본문 등장 1회당 점수
     STOPWORDS: frozenset = frozenset({
-        "이", "그", "저", "은", "는", "이", "가", "을", "를", "의", "에", "도",
+        # 조사·접속사
+        "이", "그", "저", "은", "는", "가", "을", "를", "의", "에", "도",
         "와", "과", "하고", "이고", "이며", "그리고", "그래서", "하지만",
+        "또한", "즉", "따라서", "그러나", "또는", "및",
+        # 서술어
         "있습니다", "있어요", "합니다", "해요", "됩니다", "돼요",
+        "입니다", "이에요", "이다", "한다", "된다",
+        # 일반 명사·대명사
         "것", "거", "수", "때", "더", "많이", "같은", "이런", "그런",
+        # 추상 메타 단어 (강의 구조어)
+        "개념", "정의", "목표", "목적", "기능", "시작", "발전", "차이",
+        "종류", "특징", "핵심", "단어", "강의", "내용", "설명", "이해",
+        "개요", "소개", "정리", "비교", "분석", "예시", "문제",
+        # 일반 동사·행위어
+        "실행", "요청", "종료", "생각", "과정", "사용", "제공",
+        "처리", "수행", "동작", "발생", "설치", "구현", "관련",
+        # 영어 불용어
         "the", "a", "an", "is", "are", "was", "were", "to", "of", "in",
+        "and", "or", "for", "with", "that", "this", "be", "by",
     })
 
 
@@ -189,11 +205,14 @@ def build_emphasized_keywords(
     audio_keywords: list[str],        # by_slide_v2 emphasis.keywords.all_keywords
     visual_keywords: list[str],        # slide_classified slide_emphasis[].text
     annotation_keywords: list[str],    # annotation target_content 토큰
+    slide_text_keywords: list[str],    # slide_text 본문 라인 스캔 (4번째 소스)
     cfg: Config,
 ) -> list[dict]:
     """
-    세 소스의 강조 키워드를 통합, 소스 태깅.
-    같은 키워드가 여러 소스에서 나오면 sources 배열에 모두 포함.
+    네 소스의 키워드를 통합, 소스 태깅.
+      - audio / visual / annotation: 강조 신호 → sources 배열에 포함
+      - slide_text: 본문 빈도 신호 → sources에 미포함, slide_text_score에만 누적
+    같은 키워드가 여러 강조 소스에서 나오면 sources 배열에 모두 포함.
     """
     kw_map: dict[str, dict] = {}
 
@@ -203,9 +222,11 @@ def build_emphasized_keywords(
             return
         if kw not in kw_map:
             kw_map[kw] = {"keyword": kw, "sources": [], "audio_score": 0.0,
-                          "visual_score": 0.0, "annotation_score": 0.0}
+                          "visual_score": 0.0, "annotation_score": 0.0,
+                          "slide_text_score": 0.0}
         entry = kw_map[kw]
-        if source not in entry["sources"]:
+        # slide_text는 sources에 포함하지 않음 (강조 신호가 아닌 본문 신호)
+        if source != "slide_text" and source not in entry["sources"]:
             entry["sources"].append(source)
         entry[score_key] = round(entry[score_key] + score_val, 3)
 
@@ -217,6 +238,9 @@ def build_emphasized_keywords(
 
     for kw in annotation_keywords:
         add(kw, "annotation", "annotation_score", 1.0)
+
+    for kw in slide_text_keywords:
+        add(kw, "slide_text", "slide_text_score", cfg.SLIDE_TEXT_SCORE)
 
     # sources 리스트 정렬 (재현성)
     result = []
@@ -425,8 +449,38 @@ def run_fusion(cfg: Config) -> dict:
             if tc:
                 annot_kws.extend(extract_keywords_from_text(tc, cfg.STOPWORDS, cfg.MIN_KEYWORD_LEN))
 
+        # 4번째 소스: 슬라이드 본문 라인 단위 스캔
+        # 강조 신호 없이도 슬라이드에 반복 등장하는 핵심 개념 포착
+        # 두 가지 방식 병행:
+        #   (a) 단어 분리: "독점", "자원" 등 단일 개념어
+        #   (b) 라인 전체: "파일 시스템", "메모리 관리" 등 공백 포함 복합어 보존
+        slide_text_kws: list[str] = []
+        for line in cl_slide.get("t1", "").splitlines():
+            line = line.strip()
+            if len(line) < cfg.MIN_SLIDE_TEXT_LINE_LEN:
+                continue  # 불릿(•, □), 번호(1.), 짧은 기호 제외
+
+            # (a) 단어 분리 토큰
+            slide_text_kws.extend(
+                extract_keywords_from_text(line, cfg.STOPWORDS, cfg.MIN_KEYWORD_LEN)
+            )
+
+            # (b) 복합어 후보: 공백 포함 라인이 짧으면(2~4어절) 라인 자체도 후보로 추가
+            #     "파일 시스템 관리(file system management)" 같은 라인을
+            #     괄호·영문·불릿 제거 후 2~4어절 복합어로 포착
+            #     주의: normalize_keyword는 공백을 제거하므로 복합어에는 사용 금지
+            line_clean = re.sub(r'\(.*?\)', '', line).strip()           # 괄호 내용 제거
+            line_clean = re.sub(r'[a-zA-Z0-9/]', '', line_clean).strip() # 영문·숫자·슬래시 제거
+            line_clean = re.sub(r'^[\s\-·•□▪◦]+', '', line_clean)      # 앞 불릿·대시 제거
+            line_clean = re.sub(r'\s+', ' ', line_clean).strip()
+            words = [w for w in line_clean.split() if len(w) >= 2]       # 1글자 제거
+            compound = ' '.join(words)
+            if 2 <= len(words) <= 4 and compound not in cfg.STOPWORDS:
+                if len(compound) >= cfg.MIN_KEYWORD_LEN:
+                    slide_text_kws.append(compound)
+
         emphasized_keywords = build_emphasized_keywords(
-            audio_kws, visual_kws, annot_kws, cfg
+            audio_kws, visual_kws, annot_kws, slide_text_kws, cfg
         )
 
         # ── contexts + segments (지시어 매칭 포함) ──────────────────────────
