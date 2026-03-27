@@ -24,6 +24,7 @@ import json
 import os
 import re
 from collections import Counter
+from typing import Optional, Set
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +403,7 @@ def detect_emphasis_by_topic_keyword_repetition(
     max_keywords: int = 20,
     use_llm_filter: bool = True,
     min_keyword_count: int = 1,
-    _topic_keywords_override: set[str] | None = None,
+    _topic_keywords_override: Optional[Set[str]] = None,
 ) -> list[dict]:
     """
     전사문 전체에서 반복되는 주제 키워드가 등장하는 구간을 강조로 표시.

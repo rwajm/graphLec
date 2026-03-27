@@ -1,8 +1,8 @@
 """
-json_to_graph_triples.py — fused.json → graph_triples.csv
+json_to_graph_triples.py — fused.json → 그래프 Parquet
 
 입력: {stem}_fused.json  (fusion.py 출력)
-출력: {stem}_graph_triples.csv
+출력: {stem}_graph_triples.parquet, {stem}_nodes.parquet, {stem}_edges.parquet
 
 레이어:
   - 구조 레이어: 결정론적 (Slide, Segment, AnnotationEmphasis 노드 + 관계)
@@ -14,7 +14,6 @@ json_to_graph_triples.py — fused.json → graph_triples.csv
 
 import os
 import json
-import csv
 import logging
 import time
 from pathlib import Path
@@ -40,7 +39,7 @@ class Config:
     slides_dir:  Path = Path("output_slides")
 
     fused_path:  Path = field(default=None)
-    output_csv:  Path = field(default=None)
+    output_triples_parquet: Path = field(default=None)
 
     google_api_key: str = field(default_factory=lambda: os.getenv('GOOGLE_API_KEY_2', ''))
     gemini_model:   str = "models/gemini-2.5-flash"
@@ -54,8 +53,8 @@ class Config:
         except ImportError:
             if self.fused_path is None:
                 self.fused_path = self.output_dir / f"{self.stem}_fused.json"
-        if self.output_csv is None:
-            self.output_csv = self.output_dir / f"{self.stem}_graph_triples.csv"
+        if self.output_triples_parquet is None:
+            self.output_triples_parquet = self.output_dir / f"{self.stem}_graph_triples.parquet"
 
 
 RELATION_TYPES = {
@@ -170,14 +169,10 @@ class TripleCollector:
         props_str = json.dumps(properties, ensure_ascii=False) if properties else ''
         self.triples.append((subject, predicate, obj, props_str))
 
-    def write_csv(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['subject', 'predicate', 'object', 'properties'])
-            for row in self.triples:
-                writer.writerow(row)
-        logger.info(f"✓ CSV 저장: {path} ({len(self.triples)}개 트리플)")
+    def write_parquet_outputs(self, stem: str, output_dir: Path) -> dict:
+        from graph_parquet_export import write_graph_parquet_bundle
+
+        return write_graph_parquet_bundle(self.triples, stem, output_dir)
 
 
 # ============================================================================
@@ -534,7 +529,7 @@ class GraphPipeline:
         print('📐 그래프 트리플 생성 파이프라인')
         print('='*70)
         print(f'  fused      : {cfg.fused_path}')
-        print(f'  output     : {cfg.output_csv}')
+        print(f'  output     : {cfg.output_triples_parquet} (+ nodes/edges parquet)')
 
         # ── 데이터 로드 ──────────────────────────────────────────────────────
         print('\n[Step 1] 데이터 로드')
@@ -562,9 +557,9 @@ class GraphPipeline:
         concept_count = len(collector.triples) - struct_count
         logger.info(f"✓ 개념 트리플: {concept_count}개")
 
-        # ── CSV 출력 ──────────────────────────────────────────────────────────
-        print('\n[Step 5] CSV 출력')
-        collector.write_csv(cfg.output_csv)
+        # ── Parquet 출력 (triples + nodes + edges) ───────────────────────────
+        print('\n[Step 5] Parquet 출력')
+        pq_paths = collector.write_parquet_outputs(cfg.stem, cfg.output_dir)
 
         elapsed = time.time() - start
         print('\n' + '='*70)
@@ -574,7 +569,10 @@ class GraphPipeline:
         print(f'  개념 트리플 : {concept_count}개')
         print(f'  전체 트리플 : {len(collector.triples)}개')
         print(f'  처리 시간   : {elapsed:.2f}초')
-        print(f'  출력 파일   : {cfg.output_csv}')
+        print(f'  출력 파일   :')
+        print(f'    triples : {pq_paths["triples"]}')
+        print(f'    nodes   : {pq_paths["nodes"]}')
+        print(f'    edges   : {pq_paths["edges"]}')
 
 
 # ============================================================================

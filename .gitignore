@@ -10,6 +10,8 @@ src/
 *.json
 *.jpg
 *.html
+# Django 템플릿은 버전 관리에 포함
+!web/**/templates/**/*.html
 *.txt
 *.pdf
 *.csv
@@ -38,6 +40,13 @@ venv/
 .venv/
 env/
 .env/
+
+# Django (web/)
+web/db.sqlite3
+web/staticfiles/
+
+# LanceDB 로컬 데이터
+data/lancedb/
 
 # ── Jupyter ───────────────────────────────────────────────────
 .ipynb_checkpoints/

@@ -15,6 +15,9 @@ main.py
   [병렬] Stage 4A: slide_classifier    — 슬라이드 역할 분류
          Stage 4B: by_slide 구조 저장  — (3B 결과 기반)
   [직렬] Stage 5 : fusion              — 최종 통합
+  [직렬] Stage 6 : 그래프 Parquet       — json_to_graph_triples
+  [직렬] Neo4j 적재 (옵션 스킵)        — nodes/edges Parquet → Neo4j
+  [직렬] Stage 7 : lance_ingest          — fused → Parquet + LanceDB (Gemini 임베딩, stem 필터)
 
 Usage:
     python main.py --input lecture.mp4
@@ -37,7 +40,7 @@ import logging
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import librosa
 from deictics import (
@@ -109,6 +112,51 @@ def _format_emphasis_reason(ann: dict) -> dict:
     }
 
 
+def _auto_register_lecture(stem: str) -> None:
+    """
+    파이프라인 성공 후 web Lecture 테이블에 stem을 자동 등록한다.
+    - 이미 있으면 유지
+    - 없으면 title=stem 으로 생성
+    """
+    try:
+        import os
+        from dotenv import load_dotenv
+
+        repo_root = Path(__file__).resolve().parent
+        web_dir = repo_root / "web"
+        if not web_dir.exists():
+            print("\n  ⚠️ Lecture 자동 등록 스킵: web 디렉터리를 찾을 수 없습니다.")
+            return
+
+        # main 실행 셸과 web runserver 셸의 설정 불일치를 줄이기 위해
+        # 루트 .env를 명시적으로 로드한다.
+        load_dotenv(repo_root / ".env", override=False)
+        # 로컬 테스트는 SQLite 단일 DB로 통일한다.
+        os.environ["USE_SQLITE"] = "1"
+
+        if str(web_dir) not in sys.path:
+            sys.path.insert(0, str(web_dir))
+
+        os.environ.setdefault("DJANGO_SETTINGS_MODULE", "graphlec_site.settings")
+
+        import django  # noqa: PLC0415
+
+        django.setup()
+
+        from lectures.models import Lecture  # noqa: PLC0415
+
+        lec, created = Lecture.objects.get_or_create(
+            stem=stem,
+            defaults={"title": stem},
+        )
+        status = "생성" if created else "기존 유지"
+        print(f"\n  ✓ Lecture 자동 등록: {lec.stem} ({status}, db=sqlite)")
+        print("─" * 70)
+    except Exception as e:
+        print(f"\n  ⚠️ Lecture 자동 등록 실패(분석 결과는 정상 생성): {e}")
+        print("─" * 70)
+
+
 # ──────────────────────────────────────────────────────────────
 # 전사 헬퍼
 # ──────────────────────────────────────────────────────────────
@@ -158,7 +206,7 @@ def _transcribe_range(
 def _transcribe_by_slide(
     video_path: str,
     duration: float,
-    meta_path: str | None,
+    meta_path: Optional[str],
     slide_ranges: list[dict],
     output_dir: Path,
 ) -> list[dict]:
@@ -630,10 +678,17 @@ def stage6_graph_triples(args, output_dir: Path, slides_dir: Path) -> dict:
     from json_to_graph_triples import Config as TripleConfig, GraphPipeline
 
     stem = Path(args.input).stem
-    csv_path = output_dir / f"{stem}_graph_triples.csv"
+    triples_parquet = output_dir / f"{stem}_graph_triples.parquet"
+    nodes_parquet = output_dir / f"{stem}_nodes.parquet"
+    edges_parquet = output_dir / f"{stem}_edges.parquet"
 
-    if _is_done(csv_path, "Stage 6 그래프 트리플 생성", args.force):
-        return {"csv_path": str(csv_path), "elapsed": 0.0}
+    if _is_done(triples_parquet, "Stage 6 그래프 트리플 생성", args.force):
+        return {
+            "triples_parquet": str(triples_parquet),
+            "nodes_parquet": str(nodes_parquet),
+            "edges_parquet": str(edges_parquet),
+            "elapsed": 0.0,
+        }
 
     _banner("Stage 6  —  그래프 트리플 생성  (json_to_graph_triples)")
     t0 = time.time()
@@ -647,24 +702,44 @@ def stage6_graph_triples(args, output_dir: Path, slides_dir: Path) -> dict:
 
     elapsed = time.time() - t0
     _done("그래프 트리플 생성", elapsed)
-    return {"csv_path": str(csv_path), "elapsed": elapsed}
+    return {
+        "triples_parquet": str(triples_parquet),
+        "nodes_parquet": str(nodes_parquet),
+        "edges_parquet": str(edges_parquet),
+        "elapsed": elapsed,
+    }
 
 
-def stage7_graph_import(args, csv_path: str, output_dir: Path, slides_dir: Path) -> dict:
-    from import_graph import import_graph, resolve_csv_path
+def stage7_lance_index(args, output_dir: Path, slides_dir: Path) -> dict:
+    """fused.json → 청크 임베딩 → Parquet + LanceDB (단일 테이블, stem 필터)."""
+    from lance_ingest import default_lance_root, ingest_stem_to_lance
 
     stem = Path(args.input).stem
-    resolved_csv = Path(csv_path) if csv_path else resolve_csv_path(stem, output_dir, slides_dir)
+    from config import output_paths
 
-    if not resolved_csv.exists():
-        raise FileNotFoundError(f"그래프 CSV 파일 없음: {resolved_csv}")
+    paths = output_paths(stem, output_dir, slides_dir)
+    fused_path = paths["fused"]
+    lance_root = Path(args.lance_root) if getattr(args, "lance_root", None) else default_lance_root()
+    parquet_path = output_dir / f"{stem}_chunks_lance.parquet"
 
-    _banner("Stage 7  —  그래프 DB 적재  (import_graph)")
+    if _is_done(parquet_path, "Stage 7 Lance 인덱스", args.force):
+        return {"elapsed": 0.0, "parquet_path": str(parquet_path), "skipped": True}
+
+    if not fused_path.exists():
+        raise FileNotFoundError(f"Stage 7: fused 파일 없음 — Stage 5 퓨전이 필요합니다: {fused_path}")
+
+    _banner("Stage 7  —  LanceDB 인덱스  (Gemini 임베딩 + lance_ingest)")
     t0 = time.time()
-    import_graph(resolved_csv, reset=args.neo4j_reset)
+    result = ingest_stem_to_lance(
+        stem=stem,
+        fused_path=fused_path,
+        output_dir=output_dir,
+        lance_root=lance_root,
+    )
     elapsed = time.time() - t0
-    _done("그래프 DB 적재", elapsed)
-    return {"csv_path": str(resolved_csv), "elapsed": elapsed}
+    cnt = result.get("count", 0)
+    _done(f"Lance 인덱스 ({cnt}청크)", elapsed)
+    return {"elapsed": elapsed, **result}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -785,23 +860,42 @@ def run_pipeline(args):
         )
         timings["Stage 5 퓨전"] = r5["elapsed"]
 
-        graph_csv_path = ""
+        r6: dict = {}
         if args.skip_graph_triples:
             print("\n  ⏭  Stage 6 그래프 트리플 생성 — 사용자 옵션으로 스킵")
             print("─" * 70)
             timings["Stage 6 그래프 트리플"] = 0.0
+            timings["Neo4j 적재"] = 0.0
         else:
             r6 = stage6_graph_triples(args, output_dir, slides_dir)
-            graph_csv_path = r6["csv_path"]
             timings["Stage 6 그래프 트리플"] = r6["elapsed"]
 
-        if args.skip_graph_import:
-            print("\n  ⏭  Stage 7 그래프 DB 적재 — 사용자 옵션으로 스킵")
+            if not getattr(args, "skip_neo4j", False):
+                from neo4j_ingest import stage_neo4j_ingest
+
+                _banner("Neo4j 적재  —  nodes/edges Parquet → Neo4j")
+                t_neo = time.time()
+                r_neo = stage_neo4j_ingest(args, output_dir)
+                timings["Neo4j 적재"] = time.time() - t_neo
+                _done(
+                    f"Neo4j (노드 {r_neo['node_count']}, 관계 {r_neo['edge_count']})",
+                    timings["Neo4j 적재"],
+                )
+            else:
+                print("\n  ⏭  Neo4j 적재 — 사용자 옵션으로 스킵")
+                print("─" * 70)
+                timings["Neo4j 적재"] = 0.0
+
+        if args.skip_lance_index:
+            print("\n  ⏭  Stage 7 Lance 인덱스 — 사용자 옵션으로 스킵")
             print("─" * 70)
-            timings["Stage 7 그래프 적재"] = 0.0
+            timings["Stage 7 Lance 인덱스"] = 0.0
         else:
-            r7 = stage7_graph_import(args, graph_csv_path, output_dir, slides_dir)
-            timings["Stage 7 그래프 적재"] = r7["elapsed"]
+            r7 = stage7_lance_index(args, output_dir, slides_dir)
+            timings["Stage 7 Lance 인덱스"] = r7.get("elapsed", 0.0)
+
+        # ── Lecture 자동 등록 ──
+        _auto_register_lecture(stem)
 
         # ── 생성된 파일 목록 ──
         print("\n  생성된 파일:")
@@ -815,7 +909,10 @@ def run_pipeline(args):
             classified_result.get("classified_path", ""),
             by_slide_result.get("by_slide_path", ""),
             r5.get("fused_path", ""),
-            graph_csv_path,
+            r6.get("triples_parquet", ""),
+            r6.get("nodes_parquet", ""),
+            r6.get("edges_parquet", ""),
+            str(output_dir / f"{stem}_chunks_lance.parquet"),
         ]
         for path_str in output_files:
             if not path_str:
@@ -857,7 +954,8 @@ def main():
   python main.py --input input/lecture.mp4 --skip-extract
   python main.py --input input/lecture.mp4 --debug --masks
   python main.py --input input/lecture.mp4 --force
-  python main.py --input input/lecture.mp4 --skip-graph-import
+  python main.py --input input/lecture.mp4 --skip-lance-index
+  python main.py --input input/lecture.mp4 --skip-neo4j
         """,
     )
     parser.add_argument("--input",  "-i", default="input/lecture.mp4", help="입력 강의 영상 경로 (.mp4)")
@@ -874,11 +972,19 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Stage 1 디버그 로그 출력")
     parser.add_argument("--masks", action="store_true", help="Stage 3A diff 마스크 이미지 저장")
     parser.add_argument("--skip-graph-triples", action="store_true",
-                        help="Stage 6 그래프 트리플 CSV 생성 스킵")
-    parser.add_argument("--skip-graph-import", action="store_true",
-                        help="Stage 7 Neo4j 그래프 적재 스킵")
-    parser.add_argument("--neo4j-reset", action="store_true",
-                        help="Stage 7 실행 시 기존 그래프 삭제 후 재적재")
+                        help="Stage 6 그래프 Parquet(triples/nodes/edges) 생성 스킵")
+    parser.add_argument(
+        "--skip-neo4j",
+        action="store_true",
+        help="Stage 6 직후 Neo4j 적재 스킵 (기본은 적재 시도; NEO4J_URI 등 필요)",
+    )
+    parser.add_argument("--skip-lance-index", action="store_true",
+                        help="Stage 7 LanceDB+Parquet 인덱스 스킵")
+    parser.add_argument(
+        "--lance-root",
+        default=None,
+        help="LanceDB 저장 경로 (기본: 환경변수 GRAPHLEC_LANCE_ROOT 또는 data/lancedb)",
+    )
 
     args = parser.parse_args()
 
