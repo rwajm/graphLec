@@ -40,7 +40,7 @@ from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
-_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY_1"))
+_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY_1"))
 MODEL = "gemini-2.5-flash"
 
 
