@@ -201,6 +201,101 @@ def _chunks_to_graph(chunks: list[RetrievedChunk]) -> dict:
     return {"nodes": nodes, "edges": []}
 
 
+def _evidence_to_graph(evidence: list[GraphEvidence]) -> dict:
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+    for e in evidence:
+        src_type = e.src_labels[0] if e.src_labels else "node"
+        tgt_type = e.tgt_labels[0] if e.tgt_labels else "node"
+        if e.src_id not in nodes:
+            nodes[e.src_id] = {
+                "id": e.src_id,
+                "label": e.src_id[:40],
+                "color": "#4ECDC4" if src_type == "Slide" else "#96CEB4",
+                "title": e.src_text[:300],
+                "type": src_type,
+            }
+        if e.tgt_id not in nodes:
+            nodes[e.tgt_id] = {
+                "id": e.tgt_id,
+                "label": e.tgt_id[:40],
+                "color": "#4ECDC4" if tgt_type == "Slide" else "#96CEB4",
+                "title": e.tgt_text[:300],
+                "type": tgt_type,
+            }
+        edges.append({"from": e.src_id, "to": e.tgt_id, "label": e.rel_type})
+    return {"nodes": list(nodes.values()), "edges": edges}
+
+
+def _evidence_to_timestamps(evidence: list[GraphEvidence]) -> list[dict]:
+    ts: list[dict] = []
+    for e in evidence:
+        text = f"{e.src_id} -[{e.rel_type}]-> {e.tgt_id}"
+        ts.append({"label": text[:50], "start": 0.0, "end": 0.0})
+    return ts[:20]
+
+
+def _build_graph_context(stem: str, question: str, evidence: list[GraphEvidence]) -> str:
+    lines = [
+        f"질문: {question}",
+        f"stem: {stem}",
+        "",
+        "[그래프 관계 근거]",
+    ]
+    for i, e in enumerate(evidence, start=1):
+        src_txt = (e.src_text or "").strip().replace("\n", " ")[:220]
+        tgt_txt = (e.tgt_text or "").strip().replace("\n", " ")[:220]
+        lines.append(
+            f"{i}. {e.src_id} ({','.join(e.src_labels) or '-'}) -[{e.rel_type}]-> "
+            f"{e.tgt_id} ({','.join(e.tgt_labels) or '-'})"
+        )
+        if src_txt:
+            lines.append(f"   - src 근거: {src_txt}")
+        if tgt_txt:
+            lines.append(f"   - tgt 근거: {tgt_txt}")
+    lines.append("")
+    lines.append("위 그래프 근거에 없는 내용은 추측하지 말고 모른다고 답해라.")
+    return "\n".join(lines)
+
+
+def _select_lance_supporting_chunks(
+    chunks: list[RetrievedChunk], evidence: list[GraphEvidence], max_items: int = 4
+) -> list[RetrievedChunk]:
+    """
+    A안(엄격): Lance 보강은 linked_node_id가 그래프 근거 노드(src_id/tgt_id)와
+    일치할 때만 사용한다. 키워드만으로 청크를 넣지 않는다.
+    """
+    if not chunks or not evidence:
+        return []
+
+    node_ids = {e.src_id for e in evidence} | {e.tgt_id for e in evidence}
+    selected: list[RetrievedChunk] = []
+    for c in chunks:
+        linked = (c.linked_node_id or "").strip()
+        if linked and linked in node_ids:
+            selected.append(c)
+            if len(selected) >= max_items:
+                break
+
+    return selected
+
+
+def _build_hybrid_context(
+    stem: str, question: str, evidence: list[GraphEvidence], supporting_chunks: list[RetrievedChunk]
+) -> str:
+    lines = [_build_graph_context(stem=stem, question=question, evidence=evidence)]
+    if supporting_chunks:
+        lines.extend(["", "[Lance 보강 텍스트]"])
+        for i, c in enumerate(supporting_chunks, start=1):
+            meta = f"(슬라이드 {c.slide_number}" if c.slide_number is not None else "(출처"
+            if c.start_sec is not None:
+                meta += f", {c.start_sec:.1f}초"
+            meta += ")"
+            lines.append(f"{i}. {meta} {c.text[:500]}")
+        lines.append("Lance 텍스트는 그래프 근거를 보강하는 범위에서만 사용한다.")
+    return "\n".join(lines)
+
+
 def _extract_keywords(question: str) -> list[str]:
     parts = re.split(r"[^0-9A-Za-z가-힣_]+", (question or "").lower())
     out: list[str] = []
@@ -308,51 +403,59 @@ async def internal_query_graph_evidence(req: InternalGraphQueryRequest) -> Graph
 
 @app.post("/internal/query", response_model=QueryResponse)
 async def internal_query(req: InternalQueryRequest) -> QueryResponse:
-    lance_root = default_lance_root()
-    if not lance_root.exists():
-        raise HTTPException(
-            status_code=503,
-            detail=f"LanceDB 데이터 없음: {lance_root}. 파이프라인 Stage 7 (Lance 인덱스)를 실행하세요.",
-        )
+    stem = req.stem.strip()
+    question = req.question.strip()
+    if not stem or not question:
+        raise HTTPException(status_code=400, detail="stem/question은 비어 있을 수 없습니다.")
 
-    try:
-        df = lance_search(
-            stem=req.stem,
-            query=req.question,
-            lance_root=lance_root,
-            top_k=TOP_K,
-        )
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"검색 실패: {e}") from e
-
-    if df is None or len(df) == 0:
+    evidence = graph_search_by_stem_question(stem=stem, question=question, top_k=GRAPH_TOP_K)
+    if not evidence:
         return QueryResponse(
-            answer="선택한 강의(stem)에 대한 검색 인덱스가 비어 있거나, 질문과 맞는 구간을 찾지 못했습니다.",
+            answer="그래프 근거가 없어 답변할 수 없습니다. 질문을 더 구체화하거나 강의 그래프 생성/적재 상태를 확인해주세요.",
             timestamps=[],
             graph={"nodes": [], "edges": []},
             retrieved_chunks=[],
         )
 
-    chunks = _rows_to_chunks(df)
-    context_parts = []
-    for c in chunks:
-        meta = f"(슬라이드 {c.slide_number}" if c.slide_number is not None else "(출처"
-        if c.start_sec is not None:
-            meta += f", {c.start_sec:.1f}초"
-        meta += ")"
-        context_parts.append(f"{meta}\n{c.text}")
-
-    context = "\n\n---\n\n".join(context_parts)
+    supporting_chunks: list[RetrievedChunk] = []
     try:
-        answer = _call_gemini_answer(context, req.question)
+        lance_root = default_lance_root()
+        if lance_root.exists():
+            df = lance_search(
+                stem=stem,
+                query=question,
+                lance_root=lance_root,
+                top_k=TOP_K,
+            )
+            if df is not None and len(df) > 0:
+                candidates = _rows_to_chunks(df)
+                supporting_chunks = _select_lance_supporting_chunks(
+                    chunks=candidates,
+                    evidence=evidence,
+                    max_items=4,
+                )
+    except Exception:
+        # 보강 검색 실패는 GraphRAG 기본 경로를 막지 않는다.
+        supporting_chunks = []
+
+    context = _build_hybrid_context(
+        stem=stem,
+        question=question,
+        evidence=evidence,
+        supporting_chunks=supporting_chunks,
+    )
+    try:
+        answer = _call_gemini_answer(context, question)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Gemini 답변 생성 실패: {e}") from e
 
     return QueryResponse(
         answer=answer,
-        timestamps=_chunks_to_timestamps(chunks),
-        graph=_chunks_to_graph(chunks),
-        retrieved_chunks=chunks,
+        timestamps=(
+            _chunks_to_timestamps(supporting_chunks)
+            if supporting_chunks
+            else _evidence_to_timestamps(evidence)
+        ),
+        graph=_evidence_to_graph(evidence),
+        retrieved_chunks=supporting_chunks,
     )
