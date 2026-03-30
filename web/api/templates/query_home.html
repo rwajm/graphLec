@@ -284,6 +284,19 @@
       };
     }
 
+    /*
+     * vis-network 노드 모양 — 되돌리기 참고
+     * -----------------------------------------------------------------
+     * 지금: shape "dot" + size — Neo4j처럼 고정 원형, 라벨은 원 아래(vis 기본).
+     * 원래: shape/size 미지정 → vis 기본 ellipse(라벨 길이에 따라 가로로 긴 타원).
+     * 복구: 아래 map 안에서 shape·size·dotSize 관련만 지우면 이전과 동일.
+     * 원래 노드 객체 형태만 남기면:
+     *   return {
+     *     id, label, title,
+     *     color: { background: bg, border: "#374151", highlight: { background: bg, border: "#111" } },
+     *     font: { color: "#111827", size: fontSize },
+     *   };
+     */
     function renderGraph(graph, containerId, netHolder, layoutOpts) {
       layoutOpts = layoutOpts || {};
       const container = document.getElementById(containerId);
@@ -300,10 +313,13 @@
         const id = n.id != null ? String(n.id) : "n";
         const bg = n.color || "#6b7280";
         const fontSize = nCount > 400 ? 11 : 13;
+        const dotSize = nCount > 400 ? 12 : 16;
         return {
           id: id,
           label: (n.label || id).slice(0, 48),
           title: (n.title || n.label || "").slice(0, 500),
+          shape: "dot",
+          size: dotSize,
           color: { background: bg, border: "#374151", highlight: { background: bg, border: "#111" } },
           font: { color: "#111827", size: fontSize },
         };
