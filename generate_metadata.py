@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
-_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY_1"))
 
 
 # ============================================================================
