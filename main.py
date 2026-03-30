@@ -741,6 +741,96 @@ def stage7_lance_index(args, output_dir: Path, slides_dir: Path) -> dict:
     _done(f"Lance 인덱스 ({cnt}청크)", elapsed)
     return {"elapsed": elapsed, **result}
 
+def stage8_generate_metadata(args, output_dir: Path, slides_dir: Path) -> dict:
+    """Stage 8: 강의 메타데이터 생성 (Neo4j 우선, 폴백 parquet)."""
+    from generate_metadata import generate_metadata
+    from config import output_paths
+
+    stem = Path(args.input).stem
+    metadata_dir = Path(getattr(args, "metadata_dir", "metadata"))
+    output_path = metadata_dir / f"{stem}_metadata.json"
+
+    if _is_done(output_path, "Stage 8 메타데이터 생성", args.force):
+        return {"metadata_path": str(output_path), "elapsed": 0.0}
+
+    paths = output_paths(stem, output_dir, slides_dir)
+    nodes_path = str(output_dir / f"{stem}_nodes.parquet")
+    edges_path = str(output_dir / f"{stem}_edges.parquet")
+    fused_path  = str(paths["fused"])
+
+    _banner("Stage 8  —  메타데이터 생성  (generate_metadata)")
+    t0 = time.time()
+
+    use_neo4j = not getattr(args, "skip_neo4j", False)
+    generate_metadata(
+        nodes_path  = nodes_path,
+        edges_path  = edges_path,
+        fused_path  = fused_path,
+        output_path = str(output_path),
+        basic_info_overrides = {
+            "video_id":   stem,
+            "title":      getattr(args, "title", ""),
+            "instructor": getattr(args, "instructor", ""),
+            "domain":     getattr(args, "domain", ""),
+            "language":   "ko",
+        },
+        use_neo4j = use_neo4j,
+    )
+
+    elapsed = time.time() - t0
+    _done("메타데이터 생성", elapsed)
+    return {"metadata_path": str(output_path), "elapsed": elapsed}
+
+
+def _start_services(args) -> None:
+    repo_root    = Path(__file__).resolve().parent
+    metadata_dir = str(getattr(args, "metadata_dir", "metadata"))
+    web_dir      = repo_root / "web"
+
+    cmds = {
+        "query_service  (8001)": [
+            sys.executable, "-m", "uvicorn",
+            "query_service.main:app",
+            "--host", "127.0.0.1", "--port", "8001",
+        ],
+        "recommender_web(8002)": [
+            sys.executable, str(repo_root / "recommender_web.py"),
+            "--metadata_dir", metadata_dir,
+            "--port", "8002",
+        ],
+        "django         (8000)": [                          # ← 추가
+            sys.executable, "manage.py", "runserver", "8000",
+        ],
+    }
+    cwd_map = {                                             # ← 추가
+        "django         (8000)": str(web_dir),
+    }
+
+    _banner("서비스 시작  —  Django + query_service + recommender_web (병렬)")
+    procs: dict[str, subprocess.Popen] = {}
+    for name, cmd in cmds.items():
+        cwd = cwd_map.get(name, str(repo_root))
+        proc = subprocess.Popen(cmd, cwd=cwd)
+        procs[name] = proc
+        print(f"  ▶ {name}  PID {proc.pid}")
+
+    print()
+    print("    강의 질의     → http://127.0.0.1:8000/")   # ← Django가 진입점
+    print("    추천 서비스   → http://127.0.0.1:8002/")
+    print("\n  종료: Ctrl+C")
+    print("─" * 70)
+
+    try:
+        while True:
+            time.sleep(5)
+            dead = [n for n, p in procs.items() if p.poll() is not None]
+            if dead:
+                print(f"\n  ⚠️ 비정상 종료: {', '.join(dead)}")
+                break
+    except KeyboardInterrupt:
+        print("\n  서비스 종료 중...")
+        for p in procs.values():
+            p.terminate()
 
 # ──────────────────────────────────────────────────────────────
 # 메인 파이프라인
@@ -894,8 +984,21 @@ def run_pipeline(args):
             r7 = stage7_lance_index(args, output_dir, slides_dir)
             timings["Stage 7 Lance 인덱스"] = r7.get("elapsed", 0.0)
 
+        # ── Stage 8 (직렬): 메타데이터 생성 ──  ← 여기 추가
+        if getattr(args, "skip_metadata", False):
+            print("\n  ⏭  Stage 8 메타데이터 생성 — 사용자 옵션으로 스킵")
+            print("─" * 70)
+            timings["Stage 8 메타데이터 생성"] = 0.0
+        else:
+            r8 = stage8_generate_metadata(args, output_dir, slides_dir)
+            timings["Stage 8 메타데이터 생성"] = r8["elapsed"]
+
         # ── Lecture 자동 등록 ──
         _auto_register_lecture(stem)
+
+        # ── 서비스 시작 (--serve 지정 시) ──
+        if getattr(args, "serve", False):
+            _start_services(args)
 
         # ── 생성된 파일 목록 ──
         print("\n  생성된 파일:")
@@ -913,6 +1016,7 @@ def run_pipeline(args):
             r6.get("nodes_parquet", ""),
             r6.get("edges_parquet", ""),
             str(output_dir / f"{stem}_chunks_lance.parquet"),
+            r8.get("metadata_path", ""),
         ]
         for path_str in output_files:
             if not path_str:
@@ -985,6 +1089,15 @@ def main():
         default=None,
         help="LanceDB 저장 경로 (기본: 환경변수 GRAPHLEC_LANCE_ROOT 또는 data/lancedb)",
     )
+    parser.add_argument("--skip-metadata", action="store_true",
+                        help="Stage 8 메타데이터 생성 스킵")
+    parser.add_argument("--metadata-dir", dest="metadata_dir", default="metadata",
+                        help="메타데이터 저장 디렉토리 (default: metadata/)")
+    parser.add_argument("--title",      default="", help="강의명 (미입력 시 Gemini 자동 생성)")
+    parser.add_argument("--instructor", default="", help="교수자명")
+    parser.add_argument("--domain",     default="", help="도메인 (미입력 시 Gemini 자동 추론)")
+    parser.add_argument("--serve", action="store_true",
+                        help="파이프라인 완료 후 query_service(8001) + recommender_web(8002) 자동 시작")
 
     args = parser.parse_args()
 

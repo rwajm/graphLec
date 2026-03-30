@@ -229,6 +229,54 @@ def compute_knowledge_density(kg_stats: dict, duration_sec: float) -> float:
     return round(min(kg_stats["concept_node_count"] / (duration_sec / 60) / 10.0, 1.0), 3)
 
 
+def fetch_graph_from_neo4j(
+    stem: str,
+    uri: str,
+    user: str,
+    password: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Neo4j에서 stem 서브그래프를 조회해 nodes/edges DataFrame으로 반환.
+    반환 스키마는 parquet와 동일: node_id, stem, label, properties_json / src_id, rel_type, tgt_id, stem, properties_json
+    """
+    from neo4j import GraphDatabase
+
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+    node_rows, edge_rows = [], []
+
+    try:
+        with driver.session() as session:
+            # 노드: id, stem은 메타키이므로 properties_json에서 제외
+            for rec in session.run(
+                "MATCH (n {stem: $stem}) RETURN n.id AS node_id, labels(n)[0] AS label, properties(n) AS props",
+                stem=stem,
+            ):
+                extra = {k: v for k, v in dict(rec["props"]).items() if k not in ("id", "stem")}
+                node_rows.append({
+                    "node_id":         rec["node_id"],
+                    "stem":            stem,
+                    "label":           rec["label"],
+                    "properties_json": json.dumps(extra, ensure_ascii=False),
+                })
+
+            # 엣지
+            for rec in session.run(
+                """MATCH (a {stem: $stem})-[r]->(b {stem: $stem})
+                   RETURN a.id AS src_id, type(r) AS rel_type, b.id AS tgt_id, properties(r) AS props""",
+                stem=stem,
+            ):
+                edge_rows.append({
+                    "src_id":          rec["src_id"],
+                    "rel_type":        rec["rel_type"],
+                    "tgt_id":          rec["tgt_id"],
+                    "stem":            stem,
+                    "properties_json": json.dumps(dict(rec["props"]), ensure_ascii=False),
+                })
+    finally:
+        driver.close()
+
+    print(f"  [Neo4j] 노드 {len(node_rows)}개, 엣지 {len(edge_rows)}개 조회")
+    return pd.DataFrame(node_rows), pd.DataFrame(edge_rows)
+
 # ============================================================================
 #  그룹 C — 요약/검색용
 # ============================================================================
@@ -334,7 +382,25 @@ def generate_metadata(
     basic_info_overrides: dict,
     top_concepts_n: int = 10,
     top_keywords_n: int = 10,
+    use_neo4j: bool = True,
 ) -> dict:
+    
+    # ── 노드/엣지 로드: Neo4j 우선, 폴백 parquet ──
+    neo4j_uri  = os.getenv("NEO4J_URI", "").strip()
+    neo4j_user = os.getenv("NEO4J_USER", "").strip()
+    neo4j_pw   = os.getenv("NEO4J_PASSWORD", "")
+    stem = basic_info_overrides.get("video_id", Path(nodes_path).stem.replace("_nodes", ""))
+
+    if use_neo4j and neo4j_uri and neo4j_user:
+        print("[0/6] Neo4j에서 노드/엣지 로드...")
+        nodes, edges = fetch_graph_from_neo4j(stem, neo4j_uri, neo4j_user, neo4j_pw)
+    else:
+        print("[0/6] Parquet에서 노드/엣지 로드...")
+        nodes = pd.read_parquet(nodes_path)
+        edges = pd.read_parquet(edges_path)
+
+    with open(fused_path, encoding="utf-8") as f:
+        fused = json.load(f)
 
     nodes = pd.read_parquet(nodes_path)
     edges = pd.read_parquet(edges_path)
@@ -414,6 +480,7 @@ if __name__ == "__main__":
     parser.add_argument("--language",     default="ko")
     parser.add_argument("--top_concepts", type=int, default=10)
     parser.add_argument("--top_keywords", type=int, default=10)
+    parser.add_argument("--use-parquet", action="store_true", help="Neo4j 대신 로컬 parquet 파일에서 노드/엣지 로드 (NEO4J_* 환경변수 없을 때 자동 폴백)")
     args = parser.parse_args()
 
     # config.py 패턴: output_paths()가 있으면 사용, 없으면 직접 경로 구성

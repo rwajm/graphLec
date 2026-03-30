@@ -40,7 +40,7 @@ from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
-_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY_1"))
+_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY_2"))
 MODEL = "gemini-2.5-flash"
 
 
@@ -50,11 +50,16 @@ MODEL = "gemini-2.5-flash"
 
 @dataclass
 class RecommenderConfig:
-    # 유사도 가중치 (합계 = 1.0)
+    # 이력 기반 추천 가중치 (합계 = 1.0)
     W_DOMAIN:  float = 0.20
     W_KEYWORD: float = 0.35
     W_CONCEPT: float = 0.30
     W_PREREQ:  float = 0.15
+
+    # 질의 기반 추천 가중치 (합계 = 1.0)
+    WQ_DOMAIN: float = 0.30   # 질의 추론 도메인 일치
+    WQ_TITLE:  float = 0.40   # 강의 제목 키워드 일치
+    WQ_KW:     float = 0.30   # top_keywords + top_concepts Jaccard
 
     # 이력 감쇠 (최근 강의일수록 weight 높음)
     HISTORY_KEYWORD_DECAY: float = 0.9
@@ -212,54 +217,93 @@ def compute_similarity(
 
 def compute_query_similarity(
     query_keywords: list[str],
+    query_domain:   Optional[str],        # Gemini 추론 도메인 (없으면 None)
     target: LectureMetadata,
+    cfg: RecommenderConfig,
 ) -> dict:
     """
-    질의 키워드 기반 유사도.
-      - kw_score   : query_keywords vs top_keywords + top_concepts (Jaccard)
-      - title_score: 질의 키워드가 강의 제목에 포함된 비율
-                     제목은 강의가 실제로 다루는 핵심 주제를 직접 나타내므로 높은 가중치 부여
-    """
-    TITLE_WEIGHT = 2.0
+    질의 기반 유사도 — 항상 0~1 범위.
 
+    세 신호의 가중합:
+      domain_score : 추론 도메인 == 강의 도메인       (0 or 1)
+      title_score  : 질의 키워드 ∩ 강의 제목 단어 비율 (0~1)
+      kw_score     : Jaccard(질의키워드, top_kw+concepts) (0~1)
+
+    domain이 None이면 domain_score=0, 나머지 두 가중치를 0.5:0.5로 재분배.
+    """
+    # ── domain ──────────────────────────────────────────────────────────────
+    if query_domain and query_domain != "unknown":
+        domain_score = 1.0 if target.domain == query_domain else 0.0
+        w_domain, w_title, w_kw = cfg.WQ_DOMAIN, cfg.WQ_TITLE, cfg.WQ_KW
+    else:
+        # 도메인 미확정 → domain 신호 제거 후 나머지 재분배
+        domain_score = 0.0
+        w_domain, w_title, w_kw = 0.0, 0.50, 0.50
+
+    # ── title ───────────────────────────────────────────────────────────────
+    title_words = set(target.title.replace(",", " ").replace("·", " ").split())
+    matched = sum(1 for qk in query_keywords if any(qk in tw for tw in title_words))
+    title_score = matched / max(len(query_keywords), 1)
+
+    # ── kw (Jaccard) ────────────────────────────────────────────────────────
     target_all = list(set(target.top_keywords + target.top_concepts))
     kw_score = jaccard(query_keywords, target_all)
 
-    title_words = set(target.title.replace(",", " ").replace("·", " ").split())
-    # 방향 고정: qk가 tw에 포함될 때만 매칭
-    # qk="자료구조", tw="구조" → "자료구조" in "구조" → False (오매칭 방지)
-    # qk="이미지 분류", tw="분류" → "이미지 분류" in "분류" → False
-    # qk="트리",  tw="트리와"   → "트리" in "트리와" → True ✓
-    matched = sum(1 for qk in query_keywords if qk in title_words)
-    title_score = matched / max(len(query_keywords), 1)
-
-    total = kw_score + TITLE_WEIGHT * title_score
+    # ── 가중합 → 항상 0~1 ───────────────────────────────────────────────────
+    total = (
+        w_domain * domain_score
+        + w_title  * title_score
+        + w_kw     * kw_score
+    )
 
     return {
-        "score":       round(total, 4),
-        "kw_score":    round(kw_score, 4),
-        "title_score": round(title_score, 4),
+        "score":        round(total, 4),
+        "domain_score": round(domain_score, 4),
+        "title_score":  round(title_score, 4),
+        "kw_score":     round(kw_score, 4),
     }
 
 
 # ============================================================================
-#  Gemini — 자연어 질의 키워드 추출
+#  Gemini — 자연어 질의 분석 (키워드 + 도메인 동시 추출)
 # ============================================================================
 
-def extract_keywords_from_query(query: str) -> list[str]:
-    prompt = f"""다음 질의에서 강의 검색에 사용할 핵심 키워드를 추출해줘.
+DOMAIN_CANDIDATES = [
+    "cs/operating_system", "cs/network", "cs/data_structure",
+    "cs/algorithm", "cs/database", "cs/software_engineering",
+    "math/linear_algebra", "math/statistics", "math/calculus",
+    "ml/deep_learning", "ml/machine_learning", "other",
+]
+
+def analyze_query(query: str) -> tuple[list[str], Optional[str]]:
+    """
+    질의에서 키워드와 도메인을 Gemini 1회 호출로 동시 추출.
+
+    반환:
+      keywords : 핵심 개념·기술어 2~6개
+      domain   : DOMAIN_CANDIDATES 중 하나, 해당 없으면 None
+    """
+    prompt = f"""다음 강의 검색 질의를 분석해줘.
 
 질의: "{query}"
 
-조건:
-- 질의자가 실제로 배우고 싶은 **대상 개념·기술어**만 추출
-- 수단·방법·맥락 단어 제외 (예: "공부", "방법", "알고 싶어", "추천", "배우기 전에")
-- "머신러닝 공부하기 전에 수학 뭐 알아야 해?" → ["선형대수", "통계", "미적분"] (수학 선수지식, 머신러닝X)
-- "딥러닝으로 이미지 분류하는 방법" → ["CNN", "이미지 분류", "딥러닝"] (분류 알고리즘X)
-- "SQL 쿼리 최적화" → ["SQL", "인덱스", "쿼리 최적화"] (최적화 단독X)
-- 2~6개 추출
-- JSON 배열만 출력: ["키워드1", "키워드2", ...]
-- 설명 없이 JSON만 출력"""
+다음 JSON 형식으로만 출력해 (설명 없이):
+{{
+  "keywords": ["키워드1", "키워드2", ...],
+  "domain": "도메인 문자열 또는 null"
+}}
+
+keywords 조건:
+- 질의자가 배우고 싶은 핵심 개념·기술어만 (2~6개)
+- "공부", "방법", "알고 싶어", "추천" 같은 메타 표현 제외
+- 예) "프로세스 스케줄링 알고 싶어" → ["프로세스", "스케줄링"]
+- 예) "머신러닝 전에 수학 뭐 알아야 해?" → ["선형대수", "통계", "미적분"]
+
+domain 조건:
+- 아래 중 가장 적합한 것 하나만 선택:
+  {', '.join(DOMAIN_CANDIDATES[:-1])}
+- 강의 도메인과 무관한 질의(요리, 여행 등)이면 null
+- 확신하기 어려우면 null"""
 
     response = _client.models.generate_content(
         model=MODEL,
@@ -267,7 +311,12 @@ def extract_keywords_from_query(query: str) -> list[str]:
         config={"temperature": 0.0},
     )
     text = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
+    parsed = json.loads(text)
+    keywords = parsed.get("keywords", [])
+    domain   = parsed.get("domain") or None   # "null" 문자열도 None 처리
+    if domain not in DOMAIN_CANDIDATES:
+        domain = None
+    return keywords, domain
 
 
 # ============================================================================
@@ -300,6 +349,8 @@ def _build_reason(detail: dict, mode: str) -> str:
         return " · ".join(parts) if parts else "관련 강의"
     else:
         parts = []
+        if detail.get("domain_score", 0) == 1.0:
+            parts.append("도메인 일치")
         if detail.get("title_score", 0) > 0:
             parts.append(f"제목 일치 {detail['title_score']:.0%}")
         if detail.get("kw_score", 0) > 0:
@@ -359,63 +410,17 @@ class Recommender:
 
     def recommend_from_query(self, query: str, top_k: int = 5) -> list[RecommendResult]:
         print(f"[질의 분석] {query}")
-        raw_keywords = extract_keywords_from_query(query)
-
-        # 메타데이터 어휘 집합으로 필터링
-        # — Gemini가 '프로세스 분석', '프로세스 개선' 같이 메타데이터에 없는
-        #   키워드를 추출하면 Jaccard 분모만 늘어 점수가 불안정해짐
-        # — 어휘 집합에 있는 키워드 + 어휘와 부분 일치하는 키워드만 유지
-        vocab = self.collection.vocabulary()
-
-        def _is_valid(kw: str) -> bool:
-            # 1) 정확 일치
-            if kw in vocab:
-                return True
-            # 2) 키워드의 첫 번째 토큰(핵심어)이 vocab에 정확히 존재하는지 확인
-            #    예: "프로세스 관리" → "프로세스"가 vocab에 있으면 유효
-            #        "프로세스 분석" → "프로세스"가 vocab에 있어도 "분석"은 없으므로
-            #                         복합어 전체가 vocab에 없으면 제외
-            tokens = kw.split()
-            # 모든 토큰이 vocab 단어를 포함하거나 포함되는 경우만 허용
-            return all(
-                any(tok in v or v in tok for v in vocab if len(v) >= 2)
-                for tok in tokens
-            )
-
-        query_keywords = [kw for kw in raw_keywords if _is_valid(kw)]
-        if not query_keywords:
-            query_keywords = raw_keywords  # 필터 결과가 빈 경우 원본 사용
-
-        print(f"[추출 키워드] {raw_keywords}")
-        if query_keywords != raw_keywords:
-            filtered_out = [k for k in raw_keywords if k not in query_keywords]
-            print(f"[필터 제거]   {filtered_out} (메타데이터 어휘 없음)")
-        print(f"[유효 키워드] {query_keywords}\n")
+        query_keywords, query_domain = analyze_query(query)
+        print(f"[추출 키워드] {query_keywords}")
+        print(f"[추론 도메인] {query_domain or '미확정'}\n")
 
         candidates = []
         for target in self.collection.all():
-            detail = compute_query_similarity(query_keywords, target)
+            detail = compute_query_similarity(query_keywords, query_domain, target, self.cfg)
             candidates.append((target, detail))
 
         candidates.sort(key=lambda x: x[1]["score"], reverse=True)
 
-        # ── 도메인 연관 보너스 ──────────────────────────────────────────────
-        # 1위 강의 도메인을 기준으로 같은 도메인 0점 강의에 +0.15 부여
-        # (상위 3개 기준은 무관 도메인까지 포함될 수 있어 1위만 사용)
-        DOMAIN_BONUS = 0.15
-        top_domain: str = ""
-        if candidates and candidates[0][1]["score"] > 0:
-            top_domain = candidates[0][0].domain
-
-        if top_domain:
-            for t, d in candidates:
-                if t.domain == top_domain and d["score"] == 0:
-                    d["score"]        = round(d["score"] + DOMAIN_BONUS, 4)
-                    d["domain_bonus"] = DOMAIN_BONUS
-
-        candidates.sort(key=lambda x: x[1]["score"], reverse=True)
-
-        # 전체 결과 반환 — print_results에서 top_k/score>0 필터링
         return [
             RecommendResult(
                 video_id     = t.video_id,
@@ -469,9 +474,9 @@ class Recommender:
                           f"concept={d['concept_score']:.2f}  "
                           f"prereq={d['prereq_score']:.2f}")
                 elif "kw_score" in d:
-                    title_str  = f"  title={d['title_score']:.2f}" if d.get("title_score") else ""
-                    domain_str = f"  domain_bonus={d['domain_bonus']:.2f}" if d.get("domain_bonus") else ""
-                    print(f"     신호:   kw={d['kw_score']:.2f}{title_str}{domain_str}")
+                    print(f"     신호:   domain={d.get('domain_score',0):.2f}  "
+                          f"title={d.get('title_score',0):.2f}  "
+                          f"kw={d.get('kw_score',0):.2f}")
                 print(f"     요약:   {r.summary[:80]}...")
                 print()
 
