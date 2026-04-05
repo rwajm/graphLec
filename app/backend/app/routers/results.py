@@ -204,3 +204,32 @@ async def get_job_graph(job_id: str, db: AsyncSession = Depends(get_db)):
 import httpx
 from pydantic import BaseModel
 
+class QAQuery(BaseModel):
+    question: str
+
+@router.post("/{job_id}/qa")
+async def ask_qa(job_id: str, query: QAQuery, db: AsyncSession = Depends(get_db)):
+    # Get stem (input_path filename without extension)
+    result = await db.execute(text("SELECT input_path FROM jobs WHERE id = :id"), {"id": job_id})
+    job = result.mappings().first()
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    input_path = Path(job["input_path"])
+    stem = input_path.stem
+    
+    query_service_url = os.getenv("QUERY_SERVICE_URL", "http://127.0.0.1:8001")
+    url = f"{query_service_url.rstrip('/')}/internal/query"
+    payload = {"stem": stem, "question": query.question}
+    
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            return r.json()
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Query service unreachable: {str(e)}")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"Query service error: {e.response.text}")
+
