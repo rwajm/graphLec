@@ -37,6 +37,7 @@ dist/
 build/
 .eggs/
 lib/
+!requirements.txt
 
 # ── 가상환경 ──────────────────────────────────────────────────
 venv/
@@ -55,6 +56,32 @@ data/lancedb/
 .ipynb_checkpoints/
 *.ipynb
 
+# ── React + Vite (Node.js) ────────────────────────────────────
+# 추후 디렉터리 구조 변경하며 중복 등 정리
+!app/frontend/**
+!**/glob-import/dir/node_modules
+.DS_Store
+.idea
+.pnpm-store
+*.cpuprofile
+*.local
+*.log
+/.vscode/
+/docs/.vitepress/cache
+/docs/.vitepress/.temp
+/packages/vite/LICENSE
+dist
+dist-ssr
+explorations
+node_modules
+playground-temp
+temp
+TODOs.md
+.eslintcache
+
+# ── Local Storage ─────────────────────────────────────────────
+local_storage/
+
 # ── OS ────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
@@ -62,6 +89,7 @@ desktop.ini
 
 # ── IDE ───────────────────────────────────────────────────────
 .vscode/
+.history/
 .idea/
 *.swp
 *.swo
