@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-graphlec}
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-graphlec}"]
+      interval: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: ./app/backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://user:pass@db/graphlec}
+      - GOOGLE_API_KEY_1=${GOOGLE_API_KEY_1}
+      - GOOGLE_API_KEY_2=${GOOGLE_API_KEY_2}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    volumes:
+      - .:/pipeline
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./app/frontend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:

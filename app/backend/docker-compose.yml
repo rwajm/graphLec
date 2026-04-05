@@ -1,0 +1,37 @@
+# app/backend/docker-compose.yml
+# 주의: 이 파일은 백엔드 단독 테스트용입니다. 
+# 전체 서비스 구동은 프로젝트 루트의 docker-compose.yml을 권장합니다.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-graphlec}
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-graphlec}"]
+      interval: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ../..
+      dockerfile: ./app/backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://user:pass@db/graphlec}
+      GOOGLE_API_KEY_1: ${GOOGLE_API_KEY_1}
+      GOOGLE_API_KEY_2: ${GOOGLE_API_KEY_2}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+    volumes:
+      - ../..:/pipeline
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
