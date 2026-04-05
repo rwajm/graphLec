@@ -123,3 +123,84 @@ async def get_job_timeline(job_id: str, request: Request, db: AsyncSession = Dep
             })
             
         return scenes
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading timeline: {str(e)}")
+
+@router.get("/{job_id}/graph")
+async def get_job_graph(job_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text("""
+        SELECT output_dir FROM jobs WHERE id = :id AND status = 'done'
+    """), {"id": job_id})
+    job = result.mappings().first()
+    
+    if not job or not job["output_dir"]:
+        raise HTTPException(status_code=404, detail="Graph results not found or job not completed")
+    
+    output_dir = Path(job["output_dir"])
+    
+    nodes_paths = list(output_dir.glob("*_nodes.parquet"))
+    edges_paths = list(output_dir.glob("*_edges.parquet"))
+    
+    if not nodes_paths:
+        raise HTTPException(status_code=404, detail="Graph nodes parquet not found")
+        
+    nodes_path = nodes_paths[0]
+    edges_path = edges_paths[0] if edges_paths else None
+    
+    try:
+        ndf = pd.read_parquet(nodes_path)
+        edf = pd.read_parquet(edges_path) if edges_path and edges_path.is_file() else pd.DataFrame(columns=["src_id", "rel_type", "tgt_id", "properties_json"])
+        
+        nodes_out = []
+        for _, row in ndf.iterrows():
+            nid = _str_cell(row.get("node_id"))
+            if not nid: continue
+            label = _str_cell(row.get("label")) or nid
+            props = _str_cell(row.get("properties_json")) or "{}"
+            
+            try:
+                obj = json.loads(props) if props.strip() else {}
+                ntype = _str_cell(obj.get("type")) if isinstance(obj, dict) else ""
+            except Exception:
+                ntype = ""
+                
+            nodes_out.append({
+                "id": nid,
+                "label": label[:120],
+                "title": props[:800],
+                "type": ntype or "node",
+                "color": _hex_color(label)
+            })
+            
+        seen_ids = {n["id"] for n in nodes_out}
+        
+        edges_out = []
+        for _, row in edf.iterrows():
+            src = _str_cell(row.get("src_id"))
+            tgt = _str_cell(row.get("tgt_id"))
+            rel = _str_cell(row.get("rel_type")) or "related"
+            
+            if not src or not tgt: continue
+            edges_out.append({"from": src, "to": tgt, "label": rel})
+            
+            for x in (src, tgt):
+                if x not in seen_ids:
+                    seen_ids.add(x)
+                    nodes_out.append({
+                        "id": x, "label": x[:80], "title": "", "type": "orphan", "color": "#9ca3af"
+                    })
+                    
+        return {
+            "node_count": len(nodes_out),
+            "edge_count": len(edges_out),
+            "graph": {
+                "nodes": nodes_out,
+                "edges": edges_out
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading graph: {str(e)}")
+
+import httpx
+from pydantic import BaseModel
+
