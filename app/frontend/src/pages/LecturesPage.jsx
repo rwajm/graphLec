@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { getLectureStatus, listLectures, uploadLecture, deleteLecture, retryLecture } from '../lib/api'
 
-const STAGE_LABELS = ['STT 전사', '음성 분석', '장면 감지', '통합', '요약 생성']
-const STAGE_KEYS   = ['stt', 'voice', 'scene', 'integrate', 'summarize']
+const STAGE_LABELS = ['장면 감지', '음성 분석', 'STT 전사', '통합', '요약 생성']
+const STAGE_KEYS   = ['scene', 'voice', 'stt', 'integrate', 'summarize']
 
 const STATUS_MAP = {
   done:       { label: '분석 완료', cls: 'status-done' },
