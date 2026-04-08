@@ -45,7 +45,7 @@ app.add_middleware(
 )
 
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY_2") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-GEMINI_ANSWER_MODEL = os.getenv("GEMINI_ANSWER_MODEL", "gemini-2.0-flash")
+GEMINI_ANSWER_MODEL = os.getenv("GEMINI_ANSWER_MODEL", "gemini-2.5-flash")
 TOP_K = int(os.getenv("GRAPHLEC_TOP_K", "8"))
 GRAPH_TOP_K = int(os.getenv("GRAPHLEC_GRAPH_TOP_K", "12"))
 RETRY_DELAYS = [0, 5, 15, 30]
