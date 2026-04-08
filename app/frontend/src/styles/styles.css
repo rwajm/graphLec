@@ -384,7 +384,7 @@ img { display: block; max-width: 100%; }
 }
 .tl-row:hover      { background: var(--hover); }
 .tl-row--active    { background: var(--blue-bg); border-color: var(--blue-br); }
-.tl-row--emphasis  { background: var(--amber-bg); border-color: var(--amber-br); }
+.tl-row--emphasis  { /* 스타일 제거 */ }
 .tl-row--active.tl-row--emphasis { background: var(--blue-bg); border-color: var(--blue-br); }
 
 .tl-thumb {
