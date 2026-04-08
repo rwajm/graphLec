@@ -39,10 +39,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"--- [FastAPI] ERROR initializing DB: {e} ---", flush=True)
     
-    # print("--- [FastAPI] Starting worker loops... ---", flush=True)
-    # tasks = [asyncio.create_task(worker_loop()) for _ in range(3)]
-    # print(f"--- [FastAPI] {len(tasks)} worker tasks created. ---", flush=True)
-    tasks = []
+    print("--- [FastAPI] Starting worker loops... ---", flush=True)
+    tasks = [asyncio.create_task(worker_loop()) for _ in range(3)]
+    print(f"--- [FastAPI] {len(tasks)} worker tasks created. ---", flush=True)
     
     yield
     

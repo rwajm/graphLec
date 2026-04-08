@@ -1070,7 +1070,8 @@ def run_pipeline(args, progress_callback=None):
 # CLI
 # ──────────────────────────────────────────────────────────────
 
-def main():
+def get_parser():
+    
     from config import DEFAULT_SLIDES_DIR, DEFAULT_OUTPUT_DIR
 
     parser = argparse.ArgumentParser(
@@ -1123,8 +1124,11 @@ def main():
     parser.add_argument("--domain",     default="", help="도메인 (미입력 시 Gemini 자동 추론)")
     parser.add_argument("--serve", action="store_true",
                         help="파이프라인 완료 후 query_service(8001) + recommender_web(8002) 자동 시작")
+    
+    return parser
 
-    args = parser.parse_args()
+def main():
+    args = get_parser.parse_args()
 
     if not args.skip_extract and not Path(args.input).exists():
         print(f"❌ 입력 영상 없음: {args.input}")

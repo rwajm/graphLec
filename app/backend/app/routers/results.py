@@ -56,7 +56,7 @@ async def get_job_results(job_id: str, request: Request, db: AsyncSession = Depe
                 if "local_storage" in parts:
                     idx = parts.index("local_storage")
                     rel_path = Path(*parts[idx+1:])
-                    file_url = f"{request.base_url}files/{rel_path.as_posix()}"
+                    file_url = f"/files/{rel_path.as_posix()}"
                     results.append({
                         "name": filepath.name,
                         "url": file_url
@@ -65,6 +65,17 @@ async def get_job_results(job_id: str, request: Request, db: AsyncSession = Depe
                 continue
         
     return results
+
+def _format_seconds(sec: float) -> str:
+    """초를 MM:SS 형식의 문자열로 변환합니다."""
+    if sec is None:
+        return "00:00"
+    try:
+        s = int(float(sec))
+        minutes, seconds = divmod(s, 60)
+        return f"{minutes:02d}:{seconds:02d}"
+    except (ValueError, TypeError):
+        return "00:00"
 
 @router.get("/{job_id}/timeline")
 async def get_job_timeline(job_id: str, request: Request, db: AsyncSession = Depends(get_db)):
@@ -78,51 +89,69 @@ async def get_job_timeline(job_id: str, request: Request, db: AsyncSession = Dep
     
     output_dir = Path(job["output_dir"])
     
-    # Find *_slide_classified.json
-    json_files = list(output_dir.glob("*_slide_classified.json"))
-    if not json_files:
-        raise HTTPException(status_code=404, detail="slide_classified.json not found")
-    
-    json_path = json_files[0]
-    
+    fused_files = list(output_dir.glob("*_fused.json"))
+    if not fused_files:
+        raise HTTPException(status_code=404, detail="Fused result file not found (*_fused.json)")
+    fused_path = fused_files[0]
+
+    # --- 썸네일 보충을 위해 slide_classified.json 경로 확보 ---
+    classified_files = list(output_dir.glob("*_slide_classified.json"))
+    classified_path = classified_files[0] if classified_files else None
+
     try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            
+        with open(fused_path, "r", encoding="utf-8") as f:
+            fused_data = json.load(f)
+        
+        # --- 썸네일 경로 맵 생성 ---
+        image_path_map = {}
+        if classified_path and classified_path.exists():
+            with open(classified_path, "r", encoding="utf-8") as f:
+                classified_data = json.load(f)
+            for s in classified_data.get("slides", []):
+                if "slide_number" in s and "image_path" in s:
+                    image_path_map[s["slide_number"]] = s["image_path"]
+
+        slides = fused_data.get("slides", [])
+        if not slides:
+            return []
+
+        scores = []
+        for s in slides:
+            score = s.get("emphasis_score", {}).get("total", 0) or s.get("emphasis_total", 0)
+            if score > 0:
+                scores.append(score)
+        emphasis_threshold = (sum(scores) / len(scores)) if scores else 0
+
         scenes = []
-        for s in data.get("slides", []):
-            # Convert absolute image_path to URL
+        for s in slides:
+            # --- 썸네일 경로 보충 ---
+            slide_num = s.get("slide_number")
+            image_path = image_path_map.get(slide_num)
+            
             img_url = None
-            if "image_path" in s:
-                img_path = Path(s["image_path"])
-                parts = list(img_path.parts)
-                if "local_storage" in parts:
-                    idx = parts.index("local_storage")
-                    rel_img_path = Path(*parts[idx+1:])
-                    img_url = f"{request.base_url}files/{rel_img_path.as_posix()}"
+            if image_path:
+                img_p = Path(image_path)
+                p_str = img_p.as_posix()
+                if "local_storage/" in p_str:
+                    rel_p = p_str.split("local_storage/")[1]
+                    img_url = f"/files/{rel_p}"
             
-            # Map roles to types for SceneList.jsx
-            # core/elaborated -> slide, transitional -> (optional), silent_new -> (optional)
-            scene_type = "slide"
-            if s.get("role") == "elaborated":
-                scene_type = "emphasis" # Or keep as slide
-            
-            # Formatted timestamp from 00:00:03.07 to 00:03 (frontend expects shorter often, but let's send what we have)
-            ts = s.get("timestamp_formatted", "00:00")
-            if "." in ts:
-                ts = ts.split(".")[0] # Remove milliseconds
-            if ts.startswith("00:"): # Remove leading hours if zero
-                ts = ts[3:]
+            start_sec = s.get("start_sec") or s.get("start")
+            ts = _format_seconds(start_sec)
                 
+            final_score = s.get("emphasis_score", {}).get("total", 0) or s.get("emphasis_total", 0)
+            is_emphasis = final_score > emphasis_threshold if emphasis_threshold > 0 else False
+
             scenes.append({
                 "timestamp": ts,
-                "type": scene_type,
-                "text": s.get("title") or f"Slide {s.get('slide_number')}",
+                "type": "emphasis" if is_emphasis else "slide",
+                "text": s.get("title") or s.get("slide_text", "")[:30] or f"Slide {s.get('slide_number')}",
                 "image_url": img_url,
-                "slide_number": s.get("slide_number")
+                "slide_number": slide_num,
+                "start": start_sec or 0
             })
             
-        return scenes
+        return sorted(scenes, key=lambda x: x["start"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading timeline: {str(e)}")
 
@@ -138,8 +167,9 @@ async def get_job_graph(job_id: str, db: AsyncSession = Depends(get_db)):
     
     output_dir = Path(job["output_dir"])
     
-    nodes_paths = list(output_dir.glob("*_nodes.parquet"))
-    edges_paths = list(output_dir.glob("*_edges.parquet"))
+    # 한글 파일명 대응을 위해 더 유연하게 찾기
+    nodes_paths = [p for p in output_dir.glob("*.parquet") if "nodes" in p.name.lower()]
+    edges_paths = [p for p in output_dir.glob("*.parquet") if "edges" in p.name.lower()]
     
     if not nodes_paths:
         raise HTTPException(status_code=404, detail="Graph nodes parquet not found")

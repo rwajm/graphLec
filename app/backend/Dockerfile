@@ -1,30 +1,37 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim AS base-deps
 
 WORKDIR /app
 
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender1 \
+    gcc \
+    python3-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 파이프라인 및 백엔드 전용 요구사항 파일 복사
-COPY requirements.txt ./pipeline_reqs.txt
-COPY app/backend/requirements.txt ./backend_reqs.txt
+# 파이프라인 deps
+COPY requirements.txt ./requirements_pipeline.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements_pipeline.txt
 
-# 종속성 모두 설치
-RUN pip install --no-cache-dir -r pipeline_reqs.txt -r backend_reqs.txt
+# 백엔드 deps
+COPY app/backend/requirements.txt ./requirements_backend.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements_backend.txt
 
-# 파이프라인 모듈 경로 설정
-ENV PYTHONPATH=/pipeline
+# 코드 레이어
+FROM base-deps AS final
 
-# 백엔드 코드 복사 (context가 root이므로 상대 경로로 지정)
-COPY app/backend/ .
+COPY *.py ./
+COPY app/backend/app/ ./app/
 
-# FastAPI 서버 실행 (PYTHONPATH가 설정되어 있으므로 app.main으로 직접 실행 가능)
+ENV PYTHONPATH=/app
+ENV PIPELINE_ROOT=/app
+
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
