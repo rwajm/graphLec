@@ -836,9 +836,16 @@ def _start_services(args) -> None:
 # 메인 파이프라인
 # ──────────────────────────────────────────────────────────────
 
-def run_pipeline(args):
+def run_pipeline(args, progress_callback=None):
     total_start = time.time()
     timings: dict[str, float] = {}
+    
+    def notify_stage(stage_key, status):
+        if progress_callback:
+            try:
+                progress_callback(stage_key, status)
+            except Exception as e:
+                log.warning(f"progress_callback failed for {stage_key}: {e}")
 
     from config import output_paths, DEFAULT_SLIDES_DIR, DEFAULT_OUTPUT_DIR
 
@@ -864,6 +871,9 @@ def run_pipeline(args):
         _banner("Stage 1  —  병렬 실행 (슬라이드 추출 + 오디오 품질 분석)")
         t_parallel = time.time()
         audio_analyze_result: dict = {}
+        
+        notify_stage("scene", "run")
+        notify_stage("voice", "run")
 
         if args.skip_extract:
             log.info("Stage 1A 건너뜀 (--skip-extract)")
@@ -886,6 +896,10 @@ def run_pipeline(args):
 
         duration = audio_analyze_result.get("duration", 0.0)
         timings["Stage 1 병렬 총"] = time.time() - t_parallel
+        
+        notify_stage("scene", "done")
+        notify_stage("voice", "done")
+        
         print(f"\n  ✓ Stage 1 완료  ({timings['Stage 1 병렬 총']:.1f}초)")
         print("─" * 70)
 
@@ -899,6 +913,8 @@ def run_pipeline(args):
         t_parallel = time.time()
         audio_result: dict = {}
         annotation_result: dict = {}
+        
+        notify_stage("stt", "run")
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_a = executor.submit(stage3a_annotation, args, slides_dir, output_dir)
@@ -911,6 +927,9 @@ def run_pipeline(args):
                     audio_result = future.result()
 
         timings["Stage 3 병렬 총"] = time.time() - t_parallel
+        
+        notify_stage("stt", "done")
+        
         print(f"\n  ✓ Stage 3 완료  ({timings['Stage 3 병렬 총']:.1f}초)")
         print("─" * 70)
 
@@ -941,6 +960,8 @@ def run_pipeline(args):
         print("─" * 70)
 
         # ── Stage 5 (직렬) ──
+        notify_stage("integrate", "run")
+        
         r5 = stage5_fusion(
             args,
             textualized_path=textualized_path,
@@ -975,14 +996,18 @@ def run_pipeline(args):
                 print("\n  ⏭  Neo4j 적재 — 사용자 옵션으로 스킵")
                 print("─" * 70)
                 timings["Neo4j 적재"] = 0.0
+                
+        notify_stage("integrate", "done")
 
         if args.skip_lance_index:
             print("\n  ⏭  Stage 7 Lance 인덱스 — 사용자 옵션으로 스킵")
             print("─" * 70)
             timings["Stage 7 Lance 인덱스"] = 0.0
         else:
+            notify_stage("summarize", "run")
             r7 = stage7_lance_index(args, output_dir, slides_dir)
             timings["Stage 7 Lance 인덱스"] = r7.get("elapsed", 0.0)
+            notify_stage("summarize", "done")
 
         # ── Stage 8 (직렬): 메타데이터 생성 ──  ← 여기 추가
         if getattr(args, "skip_metadata", False):
@@ -1045,7 +1070,8 @@ def run_pipeline(args):
 # CLI
 # ──────────────────────────────────────────────────────────────
 
-def main():
+def get_parser():
+    
     from config import DEFAULT_SLIDES_DIR, DEFAULT_OUTPUT_DIR
 
     parser = argparse.ArgumentParser(
@@ -1098,8 +1124,11 @@ def main():
     parser.add_argument("--domain",     default="", help="도메인 (미입력 시 Gemini 자동 추론)")
     parser.add_argument("--serve", action="store_true",
                         help="파이프라인 완료 후 query_service(8001) + recommender_web(8002) 자동 시작")
+    
+    return parser
 
-    args = parser.parse_args()
+def main():
+    args = get_parser.parse_args()
 
     if not args.skip_extract and not Path(args.input).exists():
         print(f"❌ 입력 영상 없음: {args.input}")

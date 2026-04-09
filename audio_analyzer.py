@@ -105,7 +105,7 @@ def analyze_audio_features(audio_path: str) -> dict:
     print("    - 템포 추정...")
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     features['tempo'] = {
-        'bpm': float(tempo),
+        'bpm': float(tempo.item()) if hasattr(tempo, 'item') else float(tempo),
         'description': '말하기 속도 지표 (BPM)'
     }
 
